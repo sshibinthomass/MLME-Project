@@ -52,7 +52,7 @@ tf.random.set_seed(SEED)
 
 # ──  User paths & global constants  ────────────────────────────────────────
 RAW_ROOT   = Path(r"Data/RAW DATA")
-MODEL_DIR  = Path(r"model_5files4") 
+MODEL_DIR  = Path(r"model_5files7") 
 # clean slate (avoids shape mismatches when you change LAG etc.)
 if MODEL_DIR.exists():
     shutil.rmtree(MODEL_DIR)
@@ -64,9 +64,10 @@ LAG             = 20                # number of past steps
 N_CLUSTERS      = 2
 EPOCHS_NARX     = 200
 EPOCHS_QR       = 100
-BATCH_SIZE      = 32
+BATCH_SIZE_NARX      = 32
+BATCH_SIZE_QR       = 32
 QUANTILES       = [0.1, 0.9]
-OUTPUT_WEIGHTS  = np.array([10, 6, 15, 15, 15, 10], dtype="float32")  # higher weight to PSD
+OUTPUT_WEIGHTS  = np.array([10, 6,15, 20, 20,  10], dtype="float32")  # higher weight to PSD
 
 # Column layout  (matches report)
 STATE_COLS = ['T_PM', 'c', 'd10', 'd50', 'd90', 'T_TM']
@@ -190,20 +191,112 @@ def weighted_mse(y_true, y_pred):
     return tf.reduce_mean(tf.reduce_mean(tf.square(y_true - y_pred) * w, axis=-1))
 
 def build_narx(input_dim: int, output_dim: int) -> tf.keras.Model:
-    return Sequential([
-        layers.Input(shape=(input_dim,)),
-        layers.Dense(256, activation='relu'),
-        layers.Dense(128, activation='relu'),
-        layers.Dense(output_dim)
-    ])
+    inputs = layers.Input(shape=(input_dim,))
+    
+    # First layer
+    x = layers.Dense(1024, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(5e-4))(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.4)(x)
+    
+    # Second layer with residual connection
+    dense1 = layers.Dense(512, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(5e-4))(x)
+    dense1 = layers.BatchNormalization()(dense1)
+    dense1 = layers.Dropout(0.4)(dense1)
+    
+    # Residual connection (if dimensions match)
+    if x.shape[-1] == dense1.shape[-1]:
+        x = layers.Add()([x, dense1])
+    else:
+        x = dense1
+    
+    # Third layer
+    dense2 = layers.Dense(256, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(5e-4))(x)
+    dense2 = layers.BatchNormalization()(dense2)
+    dense2 = layers.Dropout(0.3)(dense2)
+    
+    # Residual connection
+    if x.shape[-1] == dense2.shape[-1]:
+        x = layers.Add()([x, dense2])
+    else:
+        x = dense2
+    
+    # Fourth layer
+    x = layers.Dense(128, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(5e-4))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.2)(x)
+    
+    outputs = layers.Dense(output_dim)(x)
+    
+    return tf.keras.Model(inputs=inputs, outputs=outputs)
+# You can also try tuning BATCH_SIZE_NARX and dropout rates for further improvement.
 
 def build_qr(input_dim: int) -> tf.keras.Model:
-    return Sequential([
-        layers.Input(shape=(input_dim,)),
-        layers.Dense(128, activation='relu'),
-        layers.Dense(64 , activation='relu'),
-        layers.Dense(1)
-    ])
+    inputs = layers.Input(shape=(input_dim,))
+    
+    # First layer
+    x = layers.Dense(256, activation='relu')(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.3)(x)
+    
+    # Second layer with residual connection
+    dense1 = layers.Dense(128, activation='relu')(x)
+    dense1 = layers.BatchNormalization()(dense1)
+    dense1 = layers.Dropout(0.3)(dense1)
+    
+    # Residual connection
+    if x.shape[-1] == dense1.shape[-1]:
+        x = layers.Add()([x, dense1])
+    else:
+        x = dense1
+    
+    # Third layer
+    x = layers.Dense(64, activation='relu')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.2)(x)
+    
+    outputs = layers.Dense(1)(x)
+    
+    return tf.keras.Model(inputs=inputs, outputs=outputs)
+
+def build_deep_qr(input_dim: int) -> tf.keras.Model:
+    """Deeper QR model for d50 and d90 which are harder to predict."""
+    inputs = layers.Input(shape=(input_dim,))
+    
+    # First layer
+    x = layers.Dense(512, activation='relu')(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.4)(x)
+    
+    # Second layer
+    dense1 = layers.Dense(256, activation='relu')(x)
+    dense1 = layers.BatchNormalization()(dense1)
+    dense1 = layers.Dropout(0.4)(dense1)
+    
+    # Residual connection
+    if x.shape[-1] == dense1.shape[-1]:
+        x = layers.Add()([x, dense1])
+    else:
+        x = dense1
+    
+    # Third layer
+    dense2 = layers.Dense(128, activation='relu')(x)
+    dense2 = layers.BatchNormalization()(dense2)
+    dense2 = layers.Dropout(0.3)(dense2)
+    
+    # Residual connection
+    if x.shape[-1] == dense2.shape[-1]:
+        x = layers.Add()([x, dense2])
+    else:
+        x = dense2
+    
+    # Fourth layer
+    x = layers.Dense(64, activation='relu')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.2)(x)
+    
+    outputs = layers.Dense(1)(x)
+    
+    return tf.keras.Model(inputs=inputs, outputs=outputs)
 
 def pinball_loss(tau: float):
     """Pinball / quantile loss for τ."""
@@ -211,6 +304,24 @@ def pinball_loss(tau: float):
         e = y - y_hat
         return tf.reduce_mean(tf.maximum(tau * e, (tau - 1) * e))
     return loss
+
+class PrintMetricsCallback(tf.keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        metrics_str = " ".join([f"{k}={v:.6f}" for k, v in logs.items()])
+        print(f"Epoch {epoch+1}: {metrics_str}")
+
+class WarmUpLearningRateScheduler(tf.keras.callbacks.Callback):
+    def __init__(self, warmup_epochs=5, initial_lr=1e-6, target_lr=1e-4):
+        super().__init__()
+        self.warmup_epochs = warmup_epochs
+        self.initial_lr = initial_lr
+        self.target_lr = target_lr
+        
+    def on_epoch_begin(self, epoch, logs=None):
+        if epoch < self.warmup_epochs:
+            lr = self.initial_lr + (self.target_lr - self.initial_lr) * epoch / self.warmup_epochs
+            self.model.optimizer.learning_rate.assign(lr)
 
 # ──────────────────────────────────────────────────────────────────────────
 # 1. Split RAW files once into *train* and *calibration* sub-folders.
@@ -280,23 +391,55 @@ for cid in range(N_CLUSTERS):
     Xvl, Yvl = Xc[split:], Yc[split:]
 
     model = build_narx(Xc.shape[1], Yc.shape[1])
-    model.compile(optimizer=optimizers.Adam(1e-3), loss=weighted_mse)
+    model.compile(
+        optimizer=tf.keras.optimizers.AdamW(
+            learning_rate=1e-4, 
+            weight_decay=1e-4,
+            clipnorm=1.0  # Gradient clipping
+        ), 
+        loss=weighted_mse
+    )
 
-    es = callbacks.EarlyStopping(patience=8, restore_best_weights=True)
+    es = callbacks.EarlyStopping(patience=20, restore_best_weights=True)
     ck = callbacks.ModelCheckpoint(
         filepath=MODEL_DIR/f'narx/cluster_{cid}.keras',
         monitor='val_loss',
         save_best_only=True
     )
+    lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(
+        monitor='val_loss', factor=0.2, patience=4, min_lr=1e-6, verbose=1
+    )
+    warmup_scheduler = WarmUpLearningRateScheduler(warmup_epochs=5)
+    
+    history_narx = model.fit(
+        scX.transform(Xtr), scY.transform(Ytr),
+        validation_data=(scX.transform(Xvl), scY.transform(Yvl)),
+        epochs=EPOCHS_NARX,
+        batch_size=BATCH_SIZE_NARX,
+        verbose=0,
+        callbacks=[es, ck, PrintMetricsCallback(), lr_scheduler, warmup_scheduler]
+    )
 
-    model.fit(scX.transform(Xtr), scY.transform(Ytr),
-              validation_data=(scX.transform(Xvl), scY.transform(Yvl)),
-              epochs=EPOCHS_NARX,
-              batch_size=BATCH_SIZE,
-              verbose=0,
-              callbacks=[es, ck])
+
+    plt.figure()
+    plt.plot(history_narx.history['loss'], label='Train Loss')
+    plt.plot(history_narx.history['val_loss'], label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Weighted MSE Loss')
+    plt.title(f'NARX Loss Curve (Cluster {cid})')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(MODEL_DIR / f'narx/cluster_{cid}_loss_curve.png', dpi=150)
+    plt.close()
+    print(f"Saved NARX loss curve for cluster {cid} to narx/cluster_{cid}_loss_curve.png")
 
 print(" NARX training done.")
+
+
+
+#%%
+
+
 
 #%% -- store global metadata (helps inference script remain agnostic) --------
 json.dump({'state_cols': STATE_COLS, 'exog_cols': EXOG_COLS, 'lag': LAG},
@@ -348,37 +491,49 @@ loss_dir.mkdir(parents=True, exist_ok=True)
 for j, col in enumerate(STATE_COLS):
     y_err = val_E_qr[:, j:j+1]      # residual for that state
     for q in QUANTILES:
-        qr = Sequential([
-             layers.Input(shape=(val_X_qr.shape[1],)),
-             layers.Dense(128, activation='relu'),
-             layers.Dropout(0.2),
-             layers.Dense(64, activation='relu'),
-             layers.Dense(1)
-         ])
+        if col in ['d50', 'd90']:
+            qr = build_deep_qr(val_X_qr.shape[1])
+        else:
+            qr = build_qr(val_X_qr.shape[1])
 
         
-        qr.compile(optimizer=optimizers.Adam(1e-4), loss=pinball_loss(q))
+        qr.compile(
+            optimizer=tf.keras.optimizers.AdamW(
+                learning_rate=1e-4,
+                weight_decay=1e-4,
+                clipnorm=1.0
+            ), 
+            loss=pinball_loss(q)
+        )
 
         es_qr = callbacks.EarlyStopping(
-            patience=10,
+            patience=15,
             restore_best_weights=True,
             monitor="val_loss"
         )
+        
+        lr_scheduler_qr = tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6, verbose=1
+        )
+        
+        warmup_scheduler_qr = WarmUpLearningRateScheduler(warmup_epochs=3)
 
-        history = qr.fit(val_X_qr, y_err,
-                         validation_split=0.2,
-                         epochs=EPOCHS_QR,
-                         batch_size=BATCH_SIZE,
-                         verbose=0,
-                         callbacks=[es_qr])
+        history_qr = qr.fit(
+            val_X_qr, y_err,
+            validation_split=0.2,
+            epochs=EPOCHS_QR,
+            batch_size=BATCH_SIZE_QR,
+            verbose=0,
+            callbacks=[es_qr, lr_scheduler_qr, warmup_scheduler_qr, PrintMetricsCallback()]
+        )
 
         # Save model
         qr.save(MODEL_DIR / f'qr/{col}_{q:.1f}.keras')
 
         # Plot loss curves
         plt.figure()
-        plt.plot(history.history['loss'], label='train')
-        plt.plot(history.history['val_loss'], label='val')
+        plt.plot(history_qr.history['loss'], label='train')
+        plt.plot(history_qr.history['val_loss'], label='val')
         plt.title(f"{col}  τ={q:.1f}")
         plt.xlabel("Epoch")
         plt.ylabel("Pinball loss")

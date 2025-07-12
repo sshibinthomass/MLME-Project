@@ -25,8 +25,8 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # ──  Paths & runtime constants  ────────────────────────────────────────────
 TEST_DIR   = Path(r"Beat-the-Felix") #/Data/Test")
-MODEL_ROOT = Path(r"model_5files4")
-OUT_DIR    = MODEL_ROOT/"BEAT2"
+MODEL_ROOT = Path(r"model_5files7")
+OUT_DIR    = MODEL_ROOT/"BEAT1"
 OUT_DIR.mkdir(exist_ok=True)
 
 # ----------  Load metadata to stay in sync with training  -----------------
@@ -227,6 +227,7 @@ DELTAS['c']    *= 1.3
 DELTAS['d10']  *= 2.5
 DELTAS['d50']  *= 2.5
 DELTAS['d90']  *= 2.5
+
 
 
 def add_cqr(df, Xs, base_pred, mode: str):
