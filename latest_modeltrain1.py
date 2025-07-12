@@ -52,7 +52,7 @@ tf.random.set_seed(SEED)
 
 # ──  User paths & global constants  ────────────────────────────────────────
 RAW_ROOT   = Path(r"Data/RAW DATA")
-MODEL_DIR  = Path(r"model_5files7") 
+MODEL_DIR  = Path(r"model_5files8") 
 # clean slate (avoids shape mismatches when you change LAG etc.)
 if MODEL_DIR.exists():
     shutil.rmtree(MODEL_DIR)
@@ -60,14 +60,14 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 (MODEL_DIR/"narx").mkdir()
 (MODEL_DIR/"qr").mkdir()
 
-LAG             = 25                # increased lag for better temporal modeling
-N_CLUSTERS      = 3                 # increased clusters for better data separation
-EPOCHS_NARX     = 300              # increased epochs for better convergence
-EPOCHS_QR       = 150              # increased QR epochs
-BATCH_SIZE_NARX      = 16          # smaller batch size for better gradient estimates
-BATCH_SIZE_QR       = 16
+LAG             = 25                # number of past steps
+N_CLUSTERS      = 2
+EPOCHS_NARX     = 300
+EPOCHS_QR       = 100
+BATCH_SIZE_NARX      = 16
+BATCH_SIZE_QR       = 32
 QUANTILES       = [0.1, 0.9]
-OUTPUT_WEIGHTS  = np.array([8, 5, 25, 30, 35, 8], dtype="float32")  # much higher weight to PSD variables
+OUTPUT_WEIGHTS  = np.array([8, 5,25, 30, 35,  8], dtype="float32")  # higher weight to PSD
 
 # Column layout  (matches report)
 STATE_COLS = ['T_PM', 'c', 'd10', 'd50', 'd90', 'T_TM']
@@ -162,27 +162,6 @@ def preprocess(path: Path) -> pd.DataFrame:
     df = clean_iqr(read_txt(path))
     return df
 
-def augment_particle_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Add synthetic data points for particle size variables to improve training."""
-    # Create additional samples with small variations in particle size variables
-    augmented_data = []
-    
-    for idx in range(len(df)):
-        row = df.iloc[idx].copy()
-        augmented_data.append(row)
-        
-        # Add variations for particle size variables (d10, d50, d90)
-        if idx % 10 == 0:  # Add augmentation every 10th sample
-            for psd_col in ['d10', 'd50', 'd90']:
-                if psd_col in row.index:
-                    # Add small random variations (±5%)
-                    variation = np.random.uniform(-0.05, 0.05)
-                    new_row = row.copy()
-                    new_row[psd_col] = row[psd_col] * (1 + variation)
-                    augmented_data.append(new_row)
-    
-    return pd.DataFrame(augmented_data)
-
 
 # ----------  Lag-matrix creation (newest-to-oldest)  ----------------------
 def make_xy(df: pd.DataFrame, lag=LAG
@@ -211,34 +190,18 @@ def weighted_mse(y_true, y_pred):
     w = tf.constant(OUTPUT_WEIGHTS, dtype=y_true.dtype)
     return tf.reduce_mean(tf.reduce_mean(tf.square(y_true - y_pred) * w, axis=-1))
 
-def particle_size_focused_loss(y_true, y_pred):
-    """Custom loss that puts extra emphasis on particle size variables."""
-    # Standard weighted MSE
-    w = tf.constant(OUTPUT_WEIGHTS, dtype=y_true.dtype)
-    weighted_loss = tf.reduce_mean(tf.reduce_mean(tf.square(y_true - y_pred) * w, axis=-1))
-    
-    # Additional penalty for particle size variables (indices 2, 3, 4 for d10, d50, d90)
-    psd_indices = [2, 3, 4]  # d10, d50, d90
-    psd_true = tf.gather(y_true, psd_indices, axis=1)
-    psd_pred = tf.gather(y_pred, psd_indices, axis=1)
-    
-    # Higher penalty for particle size errors
-    psd_loss = tf.reduce_mean(tf.square(psd_true - psd_pred)) * 2.0
-    
-    return weighted_loss + 0.3 * psd_loss
-
 def build_narx(input_dim: int, output_dim: int) -> tf.keras.Model:
     inputs = layers.Input(shape=(input_dim,))
     
-    # First layer - deeper network for better feature extraction
-    x = layers.Dense(1536, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(1e-4))(inputs)
+    # First layer
+    x = layers.Dense(1024, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(5e-4))(inputs)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.3)(x)
+    x = layers.Dropout(0.4)(x)
     
     # Second layer with residual connection
-    dense1 = layers.Dense(768, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(1e-4))(x)
+    dense1 = layers.Dense(512, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(5e-4))(x)
     dense1 = layers.BatchNormalization()(dense1)
-    dense1 = layers.Dropout(0.3)(dense1)
+    dense1 = layers.Dropout(0.4)(dense1)
     
     # Residual connection (if dimensions match)
     if x.shape[-1] == dense1.shape[-1]:
@@ -247,9 +210,9 @@ def build_narx(input_dim: int, output_dim: int) -> tf.keras.Model:
         x = dense1
     
     # Third layer
-    dense2 = layers.Dense(384, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(1e-4))(x)
+    dense2 = layers.Dense(256, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(5e-4))(x)
     dense2 = layers.BatchNormalization()(dense2)
-    dense2 = layers.Dropout(0.25)(dense2)
+    dense2 = layers.Dropout(0.3)(dense2)
     
     # Residual connection
     if x.shape[-1] == dense2.shape[-1]:
@@ -258,14 +221,9 @@ def build_narx(input_dim: int, output_dim: int) -> tf.keras.Model:
         x = dense2
     
     # Fourth layer
-    x = layers.Dense(192, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(1e-4))(x)
+    x = layers.Dense(128, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(5e-4))(x)
     x = layers.BatchNormalization()(x)
     x = layers.Dropout(0.2)(x)
-    
-    # Fifth layer - additional layer for better capacity
-    x = layers.Dense(96, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(1e-4))(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.15)(x)
     
     outputs = layers.Dense(output_dim)(x)
     
@@ -408,29 +366,13 @@ pickle.dump(kmeans , (MODEL_DIR/'kmeans_model.pkl' ).open('wb'))
 # ──────────────────────────────────────────────────────────────────────────
 #%% 3. Train a separate NARX per cluster (with scaler per cluster).
 # --------------------------------------------------------------------------
-print("\n Training per-cluster NARX models with improved configuration for particle size prediction...")
-print("Improvements made:")
-print("- Increased lag from 20 to 25 for better temporal modeling")
-print("- Increased clusters from 2 to 3 for better data separation")
-print("- Increased epochs from 200 to 300 for better convergence")
-print("- Reduced batch size from 32 to 16 for better gradient estimates")
-print("- Increased PSD weights: d10(25), d50(30), d90(35)")
-print("- Deeper network: 1536→768→384→192→96 neurons")
-print("- Custom loss function with extra PSD penalty")
-print("- Data augmentation for particle size variables")
-print("- Lower learning rate (5e-5) with longer warmup (10 epochs)")
-print("- More conservative learning rate scheduling")
-print()
+print("\n Training per-cluster NARX models …")
 for cid in range(N_CLUSTERS):
     Xc, Yc = [], []
     for idx, p in enumerate(train_files):
         if kmeans.labels_[idx] != cid:
             continue
-        # Preprocess and optionally augment data
-        df = preprocess(p)
-        if len(df) > 100:  # Only augment if we have enough data
-            df = augment_particle_data(df)
-        x, y = make_xy(df)
+        x, y = make_xy(preprocess(p))
         if len(x):
             Xc.append(x); Yc.append(y)
     if not Xc:
@@ -451,30 +393,30 @@ for cid in range(N_CLUSTERS):
     model = build_narx(Xc.shape[1], Yc.shape[1])
     model.compile(
         optimizer=tf.keras.optimizers.AdamW(
-            learning_rate=5e-5,  # lower learning rate for better convergence
-            weight_decay=5e-5,   # reduced weight decay
-            clipnorm=0.5         # reduced gradient clipping
+            learning_rate=1e-4, 
+            weight_decay=1e-4,
+            clipnorm=1.0  # Gradient clipping
         ), 
-        loss=particle_size_focused_loss  # Use custom loss for better PSD prediction
+        loss=weighted_mse
     )
 
-    es = callbacks.EarlyStopping(patience=30, restore_best_weights=True)  # increased patience
+    es = callbacks.EarlyStopping(patience=20, restore_best_weights=True)
     ck = callbacks.ModelCheckpoint(
         filepath=MODEL_DIR/f'narx/cluster_{cid}.keras',
         monitor='val_loss',
         save_best_only=True
     )
     lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(
-        monitor='val_loss', factor=0.3, patience=8, min_lr=1e-7, verbose=1  # more conservative LR reduction
+        monitor='val_loss', factor=0.2, patience=4, min_lr=1e-6, verbose=1
     )
-    warmup_scheduler = WarmUpLearningRateScheduler(warmup_epochs=10)  # longer warmup
+    warmup_scheduler = WarmUpLearningRateScheduler(warmup_epochs=5)
     
     history_narx = model.fit(
         scX.transform(Xtr), scY.transform(Ytr),
         validation_data=(scX.transform(Xvl), scY.transform(Yvl)),
         epochs=EPOCHS_NARX,
         batch_size=BATCH_SIZE_NARX,
-        verbose=1,  # show progress for better monitoring
+        verbose=1,
         callbacks=[es, ck, PrintMetricsCallback(), lr_scheduler, warmup_scheduler]
     )
 
@@ -495,13 +437,18 @@ print(" NARX training done.")
 
 
 
-#%%
+
 
 
 
 #%% -- store global metadata (helps inference script remain agnostic) --------
 json.dump({'state_cols': STATE_COLS, 'exog_cols': EXOG_COLS, 'lag': LAG},
           (MODEL_DIR/'metadata.json').open('w'))
+
+
+#%%
+
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # 4. Collect NARX validation residuals across *all* clusters  ➜  training

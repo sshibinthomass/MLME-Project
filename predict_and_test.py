@@ -26,6 +26,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 import seaborn as sns
+from datetime import datetime
 
 #%% Set reproducibility
 SEED = 42
@@ -37,7 +38,7 @@ tf.random.set_seed(SEED)
 # Configuration
 MODEL_DIR = Path("model_5files7")
 PSD_COLS = ('d10', 'd50', 'd90')
-
+now = datetime.now().strftime("%Y%m%d_%H%M%S")
 # Load metadata
 with open(MODEL_DIR / 'metadata.json', 'r') as f:
     metadata = json.load(f)
@@ -59,7 +60,10 @@ class NARXPredictor:
     def __init__(self, model_dir: Path):
         """Initialize predictor with trained models."""
         self.model_dir = model_dir
-        self.n_clusters = 2
+        # Automatically detect number of clusters by checking available model files
+        cluster_files = list(model_dir.glob('narx/cluster_*.keras'))
+        self.n_clusters = len(cluster_files)
+        print(f"Detected {self.n_clusters} clusters from model files")
         
         # Load clustering models
         self.feature_scaler = pickle.loads((model_dir / 'feature_scaler.pkl').read_bytes())
@@ -126,7 +130,7 @@ class NARXPredictor:
         feat = np.concatenate([arr.mean(0), arr.std(0), arr.min(0), arr.max(0)])
         feat_scaled = self.feature_scaler.transform([feat])
         cluster_id = self.kmeans.predict(feat_scaled)[0]
-        return cluster_id
+        return int(cluster_id)
     
     def predict(self, df: pd.DataFrame, return_cluster_info: bool = False) -> np.ndarray:
         """Make predictions on the given dataframe."""
@@ -321,12 +325,13 @@ def test_on_file(predictor: NARXPredictor, file_path: Path, save_plots: bool = T
         plots_dir.mkdir(exist_ok=True)
         
         file_name = file_path.stem
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         predictor.plot_predictions(Y_true, Y_pred, 
-                                 save_path=plots_dir / f"{file_name}_predictions.png",
+                                 save_path=plots_dir / f"{file_name}_predictions_{timestamp}.png",
                                  title=f"Predictions for {file_name}")
         
         predictor.plot_time_series(df_clean, Y_pred,
-                                 save_path=plots_dir / f"{file_name}_timeseries.png")
+                                 save_path=plots_dir / f"{file_name}_timeseries_{timestamp}.png")
     
     return metrics
 
