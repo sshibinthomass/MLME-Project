@@ -52,7 +52,7 @@ tf.random.set_seed(SEED)
 
 # ──  User paths & global constants  ────────────────────────────────────────
 RAW_ROOT   = Path(r"Data/RAW DATA")
-MODEL_DIR  = Path(r"model_5files8") 
+MODEL_DIR  = Path(r"model_5files10") 
 # clean slate (avoids shape mismatches when you change LAG etc.)
 if MODEL_DIR.exists():
     shutil.rmtree(MODEL_DIR)
@@ -67,12 +67,11 @@ EPOCHS_QR       = 100
 BATCH_SIZE_NARX      = 16
 BATCH_SIZE_QR       = 32
 QUANTILES       = [0.1, 0.9]
-OUTPUT_WEIGHTS  = np.array([8, 5,25, 30, 35,  8], dtype="float32")  # higher weight to PSD
+OUTPUT_WEIGHTS  = np.array([8, 6, 25, 30, 35, 8], dtype="float32")  # higher weight to PSD (6 outputs)
 
 # Column layout  (matches report)
 STATE_COLS = ['T_PM', 'c', 'd10', 'd50', 'd90', 'T_TM']
-EXOG_COLS  = ['mf_PM', 'mf_TM', 'Q_g', 'w_crystal',
-              'c_in', 'T_PM_in', 'T_TM_in']
+EXOG_COLS  = ['mf_PM', 'mf_TM', 'Q_g', 'w_crystal']  # Removed constant variables
 OUTPUT_COLS = STATE_COLS
 CLUST_COLS  = STATE_COLS + EXOG_COLS
 
@@ -95,19 +94,22 @@ def clean_iqr(df: pd.DataFrame) -> pd.DataFrame:
     Clear out outliers from data using IQR (Interquantile Range) method
     (Also includes extra steps to drop empty rows)
     """
-    df = df.dropna(subset=CLUST_COLS) #Drop empty rows
+    # Only process columns that are in CLUST_COLS (excludes constant variables)
+    available_cols = [col for col in CLUST_COLS if col in df.columns]
+    df = df.dropna(subset=available_cols) #Drop empty rows
 
     for column in df.columns:
-        Q1 = df[column].quantile(0.25)
-        Q3 = df[column].quantile(0.75)
-        IQR = Q3 - Q1
+        if column in available_cols:  # Only process relevant columns
+            Q1 = df[column].quantile(0.25)
+            Q3 = df[column].quantile(0.75)
+            IQR = Q3 - Q1
 
-        lower_bound = Q1 - 1.5*IQR
-        upper_bound = Q3 + 1.5*IQR
+            lower_bound = Q1 - 1.5*IQR
+            upper_bound = Q3 + 1.5*IQR
 
-        df[column] = df[column].apply(
-            lambda x: lower_bound if x < lower_bound else (upper_bound if x > upper_bound else x)
-        )
+            df[column] = df[column].apply(
+                lambda x: lower_bound if x < lower_bound else (upper_bound if x > upper_bound else x)
+            )
 
     return df
 
@@ -345,9 +347,361 @@ if not train_dir.exists():
     for p in files[:n_cal]: shutil.copy(p, calib_dir/p.name)
 
 # ──────────────────────────────────────────────────────────────────────────
-# 2. Unsupervised clustering on summary stats  ➜  k-means labels.
+#%% 2.5. Data Visualization Before and After Preprocessing
 # --------------------------------------------------------------------------
+print("\n" + "="*60)
+print("📊 DATA VISUALIZATION BEFORE AND AFTER PREPROCESSING")
+print("="*60)
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+
+# Create visualization directory
+viz_dir = MODEL_DIR / 'data_visualization'
+viz_dir.mkdir(exist_ok=True)
+
+# Set style for better plots
+plt.style.use('default')
+sns.set_palette("husl")
+
+# Get train files for visualization
 train_files = sorted(train_dir.glob("*.txt"))
+
+# Sample a few files for visualization (to avoid overwhelming plots)
+sample_files = train_files[:5]  # First 5 files
+print(f"\n📁 Analyzing {len(sample_files)} sample files for visualization...")
+
+# Collect data for visualization
+raw_data = []
+cleaned_data = []
+iqr_cleaned_data = []
+
+for p in sample_files:
+    # Raw data
+    raw_df = read_txt(p)
+    raw_data.append(raw_df)
+    
+    # Cleaned data (original method)
+    cleaned_df = clean_df(raw_df)
+    cleaned_data.append(cleaned_df)
+    
+    # IQR cleaned data (current method)
+    iqr_df = clean_iqr(raw_df)
+    iqr_cleaned_data.append(iqr_df)
+
+# Combine all data for analysis
+raw_combined = pd.concat(raw_data, ignore_index=True)
+cleaned_combined = pd.concat(cleaned_data, ignore_index=True)
+iqr_combined = pd.concat(iqr_cleaned_data, ignore_index=True)
+
+print(f"\n📈 Data Statistics Summary:")
+print(f"Raw data: {len(raw_combined)} rows")
+print(f"Cleaned (original): {len(cleaned_combined)} rows")
+print(f"Cleaned (IQR): {len(iqr_combined)} rows")
+
+# 1. Data Loss Analysis
+print(f"\n📉 Data Loss Analysis:")
+for col in CLUST_COLS:
+    raw_count = raw_combined[col].notna().sum()
+    cleaned_count = cleaned_combined[col].notna().sum()
+    iqr_count = iqr_combined[col].notna().sum()
+    
+    print(f"  {col}:")
+    print(f"    Raw: {raw_count} valid values")
+    print(f"    Cleaned (original): {cleaned_count} ({cleaned_count/raw_count*100:.1f}%)")
+    print(f"    Cleaned (IQR): {iqr_count} ({iqr_count/raw_count*100:.1f}%)")
+
+# 2. Distribution Comparison Plots
+print(f"\n🎨 Creating distribution comparison plots...")
+
+# Create subplots for each column - adjust layout for 14 columns
+n_cols = 4
+n_rows = (len(CLUST_COLS) + n_cols - 1) // n_cols  # Ceiling division
+fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 5*n_rows))
+axes = axes.flatten()
+
+for i, col in enumerate(CLUST_COLS):
+    ax = axes[i]
+    
+    # Plot histograms
+    ax.hist(raw_combined[col].dropna(), bins=50, alpha=0.5, label='Raw', density=True, color='red')
+    ax.hist(cleaned_combined[col].dropna(), bins=50, alpha=0.5, label='Cleaned (Original)', density=True, color='blue')
+    ax.hist(iqr_combined[col].dropna(), bins=50, alpha=0.5, label='Cleaned (IQR)', density=True, color='green')
+    
+    ax.set_title(f'{col} Distribution')
+    ax.set_xlabel(col)
+    ax.set_ylabel('Density')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+# Remove extra subplots
+for i in range(len(CLUST_COLS), len(axes)):
+    fig.delaxes(axes[i])
+
+plt.tight_layout()
+plt.savefig(viz_dir / 'distribution_comparison.png', dpi=150, bbox_inches='tight')
+plt.close()
+
+# 3. Box Plots for Outlier Detection
+print(f"📦 Creating box plots for outlier analysis...")
+
+# Create subplots for box plots - adjust layout for 14 columns
+n_cols = 4
+n_rows = (len(CLUST_COLS) + n_cols - 1) // n_cols  # Ceiling division
+fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 5*n_rows))
+axes = axes.flatten()
+
+for i, col in enumerate(CLUST_COLS):
+    ax = axes[i]
+    
+    # Prepare data for box plot
+    data_to_plot = []
+    labels = []
+    
+    if len(raw_combined[col].dropna()) > 0:
+        data_to_plot.append(raw_combined[col].dropna())
+        labels.append('Raw')
+    
+    if len(cleaned_combined[col].dropna()) > 0:
+        data_to_plot.append(cleaned_combined[col].dropna())
+        labels.append('Cleaned (Original)')
+    
+    if len(iqr_combined[col].dropna()) > 0:
+        data_to_plot.append(iqr_combined[col].dropna())
+        labels.append('Cleaned (IQR)')
+    
+    if data_to_plot:
+        bp = ax.boxplot(data_to_plot, labels=labels, patch_artist=True)
+        
+        # Color the boxes
+        colors = ['lightcoral', 'lightblue', 'lightgreen']
+        for patch, color in zip(bp['boxes'], colors[:len(bp['boxes'])]):
+            patch.set_facecolor(color)
+    
+    ax.set_title(f'{col} Box Plot')
+    ax.set_ylabel(col)
+    ax.grid(True, alpha=0.3)
+    plt.setp(ax.get_xticklabels(), rotation=45)
+
+# Remove extra subplots
+for i in range(len(CLUST_COLS), len(axes)):
+    fig.delaxes(axes[i])
+
+plt.tight_layout()
+plt.savefig(viz_dir / 'box_plots.png', dpi=150, bbox_inches='tight')
+plt.close()
+
+# 4. Statistical Summary Table
+print(f"📊 Creating statistical summary...")
+
+stats_summary = {}
+for col in CLUST_COLS:
+    stats_summary[col] = {
+        'raw': {
+            'count': raw_combined[col].notna().sum(),
+            'mean': raw_combined[col].mean(),
+            'std': raw_combined[col].std(),
+            'min': raw_combined[col].min(),
+            'max': raw_combined[col].max(),
+            'q25': raw_combined[col].quantile(0.25),
+            'q75': raw_combined[col].quantile(0.75)
+        },
+        'cleaned_original': {
+            'count': cleaned_combined[col].notna().sum(),
+            'mean': cleaned_combined[col].mean(),
+            'std': cleaned_combined[col].std(),
+            'min': cleaned_combined[col].min(),
+            'max': cleaned_combined[col].max(),
+            'q25': cleaned_combined[col].quantile(0.25),
+            'q75': cleaned_combined[col].quantile(0.75)
+        },
+        'cleaned_iqr': {
+            'count': iqr_combined[col].notna().sum(),
+            'mean': iqr_combined[col].mean(),
+            'std': iqr_combined[col].std(),
+            'min': iqr_combined[col].min(),
+            'max': iqr_combined[col].max(),
+            'q25': iqr_combined[col].quantile(0.25),
+            'q75': iqr_combined[col].quantile(0.75)
+        }
+    }
+
+# Save statistical summary
+import json
+with open(viz_dir / 'statistical_summary.json', 'w') as f:
+    json.dump(stats_summary, f, indent=2, default=str)
+
+# 5. Correlation Analysis
+print(f"🔗 Creating correlation analysis...")
+
+# Calculate correlations for each dataset
+raw_corr = raw_combined[CLUST_COLS].corr()
+cleaned_corr = cleaned_combined[CLUST_COLS].corr()
+iqr_corr = iqr_combined[CLUST_COLS].corr()
+
+# Plot correlation matrices
+fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+# Raw data correlation
+im1 = axes[0].imshow(raw_corr, cmap='coolwarm', vmin=-1, vmax=1)
+axes[0].set_title('Raw Data Correlation')
+axes[0].set_xticks(range(len(CLUST_COLS)))
+axes[0].set_yticks(range(len(CLUST_COLS)))
+axes[0].set_xticklabels(CLUST_COLS, rotation=45)
+axes[0].set_yticklabels(CLUST_COLS)
+
+# Add correlation values
+for i in range(len(CLUST_COLS)):
+    for j in range(len(CLUST_COLS)):
+        text = axes[0].text(j, i, f'{raw_corr.iloc[i, j]:.2f}',
+                           ha="center", va="center", color="black", fontsize=8)
+
+# Cleaned data correlation
+im2 = axes[1].imshow(cleaned_corr, cmap='coolwarm', vmin=-1, vmax=1)
+axes[1].set_title('Cleaned (Original) Correlation')
+axes[1].set_xticks(range(len(CLUST_COLS)))
+axes[1].set_yticks(range(len(CLUST_COLS)))
+axes[1].set_xticklabels(CLUST_COLS, rotation=45)
+axes[1].set_yticklabels(CLUST_COLS)
+
+for i in range(len(CLUST_COLS)):
+    for j in range(len(CLUST_COLS)):
+        text = axes[1].text(j, i, f'{cleaned_corr.iloc[i, j]:.2f}',
+                           ha="center", va="center", color="black", fontsize=8)
+
+# IQR cleaned data correlation
+im3 = axes[2].imshow(iqr_corr, cmap='coolwarm', vmin=-1, vmax=1)
+axes[2].set_title('Cleaned (IQR) Correlation')
+axes[2].set_xticks(range(len(CLUST_COLS)))
+axes[2].set_yticks(range(len(CLUST_COLS)))
+axes[2].set_xticklabels(CLUST_COLS, rotation=45)
+axes[2].set_yticklabels(CLUST_COLS)
+
+for i in range(len(CLUST_COLS)):
+    for j in range(len(CLUST_COLS)):
+        text = axes[2].text(j, i, f'{iqr_corr.iloc[i, j]:.2f}',
+                           ha="center", va="center", color="black", fontsize=8)
+
+plt.colorbar(im3, ax=axes, shrink=0.8)
+plt.tight_layout()
+plt.savefig(viz_dir / 'correlation_matrices.png', dpi=150, bbox_inches='tight')
+plt.close()
+
+# 6. Time Series Visualization (for one file)
+print(f"⏰ Creating time series visualization...")
+
+if len(sample_files) > 0:
+    sample_file = sample_files[0]
+    raw_sample = read_txt(sample_file)
+    cleaned_sample = clean_iqr(raw_sample)
+    
+    fig, axes = plt.subplots(3, 2, figsize=(15, 12))
+    
+    # Plot first 6 columns as time series
+    for i, col in enumerate(CLUST_COLS[:6]):
+        row = i // 2
+        col_idx = i % 2
+        
+        axes[row, col_idx].plot(raw_sample.index, raw_sample[col], 
+                               label='Raw', alpha=0.7, color='red')
+        axes[row, col_idx].plot(cleaned_sample.index, cleaned_sample[col], 
+                               label='Cleaned', alpha=0.7, color='blue')
+        axes[row, col_idx].set_title(f'{col} Time Series')
+        axes[row, col_idx].set_xlabel('Time Step')
+        axes[row, col_idx].set_ylabel(col)
+        axes[row, col_idx].legend()
+        axes[row, col_idx].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(viz_dir / 'time_series_comparison.png', dpi=150, bbox_inches='tight')
+    plt.close()
+
+# 7. Outlier Analysis
+print(f"🔍 Creating outlier analysis...")
+
+outlier_analysis = {}
+for col in CLUST_COLS:
+    raw_data_col = raw_combined[col].dropna()
+    iqr_data_col = iqr_combined[col].dropna()
+    
+    # Calculate IQR for raw data
+    Q1 = raw_data_col.quantile(0.25)
+    Q3 = raw_data_col.quantile(0.75)
+    IQR = Q3 - Q1
+    lower_bound = Q1 - 1.5 * IQR
+    upper_bound = Q3 + 1.5 * IQR
+    
+    # Count outliers
+    outliers = ((raw_data_col < lower_bound) | (raw_data_col > upper_bound)).sum()
+    total_points = len(raw_data_col)
+    
+    outlier_analysis[col] = {
+        'total_points': total_points,
+        'outliers_removed': outliers,
+        'outlier_percentage': (outliers / total_points) * 100,
+        'lower_bound': lower_bound,
+        'upper_bound': upper_bound,
+        'Q1': Q1,
+        'Q3': Q3,
+        'IQR': IQR
+    }
+
+# Save outlier analysis
+with open(viz_dir / 'outlier_analysis.json', 'w') as f:
+    json.dump(outlier_analysis, f, indent=2, default=str)
+
+# Print outlier summary
+print(f"\n📊 Outlier Analysis Summary:")
+for col, stats in outlier_analysis.items():
+    print(f"  {col}:")
+    print(f"    Total points: {stats['total_points']}")
+    print(f"    Outliers removed: {stats['outliers_removed']} ({stats['outlier_percentage']:.1f}%)")
+    print(f"    IQR bounds: [{stats['lower_bound']:.2e}, {stats['upper_bound']:.2e}]")
+
+# 8. Data Quality Report
+print(f"\n📋 Creating data quality report...")
+
+quality_report = {
+    'preprocessing_summary': {
+        'files_analyzed': len(sample_files),
+        'raw_total_rows': len(raw_combined),
+        'cleaned_total_rows': len(iqr_combined),
+        'data_retention_rate': len(iqr_combined) / len(raw_combined) * 100
+    },
+    'column_analysis': {}
+}
+
+for col in CLUST_COLS:
+    raw_nulls = raw_combined[col].isna().sum()
+    cleaned_nulls = iqr_combined[col].isna().sum()
+    
+    quality_report['column_analysis'][col] = {
+        'raw_null_count': int(raw_nulls),
+        'cleaned_null_count': int(cleaned_nulls),
+        'null_reduction': int(raw_nulls - cleaned_nulls),
+        'outlier_analysis': outlier_analysis[col]
+    }
+
+# Save quality report
+with open(viz_dir / 'data_quality_report.json', 'w') as f:
+    json.dump(quality_report, f, indent=2, default=str)
+
+print(f"\n✅ Data visualization complete!")
+print(f"📁 Visualizations saved to: {viz_dir}")
+print(f"📊 Data Quality Summary:")
+print(f"   Raw data rows: {len(raw_combined)}")
+print(f"   Cleaned data rows: {len(iqr_combined)}")
+print(f"   Data retention: {len(iqr_combined)/len(raw_combined)*100:.1f}%")
+
+print("\n" + "="*60)
+
+# ──────────────────────────────────────────────────────────────────────────
+#%% 2.5. Clustering Analysis and Scoring
+# --------------------------------------------------------------------------
+print("\n" + "="*60)
+print("🔍 CLUSTERING ANALYSIS AND SCORING")
+print("="*60)
 
 feat = []
 for p in train_files:
@@ -362,6 +716,216 @@ kmeans  = KMeans(n_clusters=N_CLUSTERS, random_state=SEED).fit(feat_s)
 
 pickle.dump(sc_feat, (MODEL_DIR/'feature_scaler.pkl').open('wb'))
 pickle.dump(kmeans , (MODEL_DIR/'kmeans_model.pkl' ).open('wb'))
+
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Get cluster assignments
+cluster_labels = kmeans.labels_
+unique_clusters = np.unique(cluster_labels)
+
+print(f"\n📊 Clustering Results:")
+print(f"Number of clusters: {len(unique_clusters)}")
+print(f"Total files: {len(train_files)}")
+
+# 1. Cluster Distribution Analysis
+print(f"\n📈 Cluster Distribution:")
+cluster_counts = np.bincount(cluster_labels)
+for cid in unique_clusters:
+    count = cluster_counts[cid]
+    percentage = (count / len(train_files)) * 100
+    print(f"  Cluster {cid}: {count} files ({percentage:.1f}%)")
+
+# 2. Clustering Quality Metrics
+print(f"\n🎯 Clustering Quality Metrics:")
+silhouette = silhouette_score(feat_s, cluster_labels)
+calinski = calinski_harabasz_score(feat_s, cluster_labels)
+davies = davies_bouldin_score(feat_s, cluster_labels)
+
+print(f"  Silhouette Score: {silhouette:.4f} (Higher is better, range: -1 to 1)")
+print(f"  Calinski-Harabasz Score: {calinski:.2f} (Higher is better)")
+print(f"  Davies-Bouldin Score: {davies:.4f} (Lower is better)")
+
+# 3. Feature Importance Analysis
+print(f"\n🔍 Feature Importance Analysis:")
+feature_names = []
+for col in CLUST_COLS:
+    feature_names.extend([f'{col}_mean', f'{col}_std', f'{col}_min', f'{col}_max'])
+
+feature_importance = np.zeros(len(feature_names))
+for i in range(len(feature_names)):
+    if i < len(feat_s[0]):
+        overall_mean = np.mean(feat_s[:, i])
+        between_cluster_var = 0
+        within_cluster_var = 0
+        
+        for cluster_id in unique_clusters:
+            cluster_mask = cluster_labels == cluster_id
+            cluster_mean = np.mean(feat_s[cluster_mask, i])
+            cluster_size = np.sum(cluster_mask)
+            
+            between_cluster_var += cluster_size * (cluster_mean - overall_mean)**2
+            within_cluster_var += np.sum((feat_s[cluster_mask, i] - cluster_mean)**2)
+        
+        # Add small epsilon to prevent division by zero and handle numerical instability
+        epsilon = 1e-10
+        if within_cluster_var > epsilon:
+            feature_importance[i] = between_cluster_var / (within_cluster_var + epsilon)
+        else:
+            # If within-cluster variance is too small, use a different metric
+            feature_importance[i] = between_cluster_var / epsilon
+
+# Show top features
+top_features = 10
+top_indices = np.argsort(feature_importance)[-top_features:]
+print(f"  Top {top_features} features driving cluster separation:")
+for i, idx in enumerate(top_indices):
+    print(f"    {i+1}. {feature_names[idx]}: {feature_importance[idx]:.3f}")
+
+# Diagnostic: Why certain features might not appear
+print(f"\n🔍 Diagnostic: Feature Variance Analysis:")
+for col in CLUST_COLS:
+    col_idx = CLUST_COLS.index(col)
+    mean_idx = col_idx * 4
+    std_idx = col_idx * 4 + 1
+    min_idx = col_idx * 4 + 2
+    max_idx = col_idx * 4 + 3
+    
+    print(f"  {col}:")
+    print(f"    Mean importance: {feature_importance[mean_idx]:.3f}")
+    print(f"    Std importance:  {feature_importance[std_idx]:.3f}")
+    print(f"    Min importance:  {feature_importance[min_idx]:.3f}")
+    print(f"    Max importance:  {feature_importance[max_idx]:.3f}")
+    
+    # Check if this feature has low variance
+    if feature_importance[std_idx] < 0.1:
+        print(f"    ⚠️  Low std importance - may indicate low variance in {col}")
+    
+    # Show actual variance values for debugging
+    feature_values = feat[:, std_idx]  # Get std values for this column
+    print(f"    Actual std values - min: {np.min(feature_values):.2e}, max: {np.max(feature_values):.2e}")
+
+# 4. Cluster Separation Analysis
+print(f"\n📊 Cluster Separation Analysis:")
+for cid in unique_clusters:
+    cluster_mask = cluster_labels == cid
+    cluster_data = feat_s[cluster_mask]
+    cluster_center = kmeans.cluster_centers_[cid]
+    
+    # Calculate average distance to cluster center
+    distances = np.linalg.norm(cluster_data - cluster_center, axis=1)
+    avg_distance = np.mean(distances)
+    std_distance = np.std(distances)
+    
+    print(f"  Cluster {cid}:")
+    print(f"    Size: {np.sum(cluster_mask)} files")
+    print(f"    Avg distance to center: {avg_distance:.4f} ± {std_distance:.4f}")
+
+# 5. Inter-cluster Distance Analysis
+print(f"\n📏 Inter-cluster Distances:")
+for i in range(len(unique_clusters)):
+    for j in range(i+1, len(unique_clusters)):
+        cid1, cid2 = unique_clusters[i], unique_clusters[j]
+        center1 = kmeans.cluster_centers_[cid1]
+        center2 = kmeans.cluster_centers_[cid2]
+        distance = np.linalg.norm(center1 - center2)
+        print(f"  Cluster {cid1} ↔ Cluster {cid2}: {distance:.4f}")
+
+# 6. Create Clustering Visualization
+print(f"\n🎨 Creating clustering visualizations...")
+viz_dir = MODEL_DIR / 'clustering_analysis'
+viz_dir.mkdir(exist_ok=True)
+
+# PCA visualization
+pca = PCA(n_components=2)
+feat_pca = pca.fit_transform(feat_s)
+
+plt.figure(figsize=(10, 8))
+colors = plt.cm.Set3(np.linspace(0, 1, len(unique_clusters)))
+
+for i, cid in enumerate(unique_clusters):
+    mask = cluster_labels == cid
+    plt.scatter(feat_pca[mask, 0], feat_pca[mask, 1], 
+               c=[colors[i]], label=f'Cluster {cid}',
+               s=100, alpha=0.7, edgecolors='black', linewidth=0.5)
+
+# Plot cluster centers
+centers_pca = pca.transform(kmeans.cluster_centers_)
+plt.scatter(centers_pca[:, 0], centers_pca[:, 1], 
+           c='red', s=200, marker='x', linewidths=3, 
+           label='Cluster Centers', zorder=5)
+
+plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)')
+plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)')
+plt.title('Cluster Visualization using PCA')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig(viz_dir / 'pca_clusters.png', dpi=150, bbox_inches='tight')
+plt.close()
+
+# Feature importance plot
+plt.figure(figsize=(12, 8))
+y_pos = np.arange(top_features)
+plt.barh(y_pos, feature_importance[top_indices], color='skyblue')
+plt.yticks(y_pos, [feature_names[i] for i in top_indices])
+plt.xlabel('Feature Importance (Between/Within Cluster Variance)')
+plt.title('Top Features Contributing to Cluster Separation')
+plt.gca().invert_yaxis()
+plt.tight_layout()
+plt.savefig(viz_dir / 'feature_importance.png', dpi=150, bbox_inches='tight')
+plt.close()
+
+# Cluster distribution plot
+plt.figure(figsize=(10, 6))
+bars = plt.bar(range(len(unique_clusters)), cluster_counts, color=colors[:len(unique_clusters)])
+plt.xlabel('Cluster ID')
+plt.ylabel('Number of Files')
+plt.title('Distribution of Files Across Clusters')
+plt.xticks(range(len(unique_clusters)))
+
+# Add count labels on bars
+for i, bar in enumerate(bars):
+    height = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width()/2., height + 0.5,
+            f'{int(height)}', ha='center', va='bottom', fontweight='bold')
+
+plt.tight_layout()
+plt.savefig(viz_dir / 'cluster_distribution.png', dpi=150, bbox_inches='tight')
+plt.close()
+
+# 7. Save Detailed Analysis Report
+analysis_report = {
+    'clustering_metrics': {
+        'silhouette_score': float(silhouette),
+        'calinski_harabasz_score': float(calinski),
+        'davies_bouldin_score': float(davies)
+    },
+    'cluster_distribution': {
+        str(cid): int(cluster_counts[cid]) for cid in unique_clusters
+    },
+    'feature_importance': {
+        feature_names[i]: float(feature_importance[i]) for i in range(len(feature_names))
+    },
+    'top_features': [feature_names[i] for i in top_indices],
+    'cluster_centers': kmeans.cluster_centers_.tolist(),
+    'n_clusters': len(unique_clusters),
+    'total_files': len(train_files)
+}
+
+import json
+with open(viz_dir / 'clustering_analysis_report.json', 'w') as f:
+    json.dump(analysis_report, f, indent=2)
+
+print(f"\n✅ Clustering analysis complete!")
+print(f"📁 Analysis saved to: {viz_dir}")
+print(f"📊 Quality Summary:")
+print(f"   Silhouette: {silhouette:.4f} ({'Good' if silhouette > 0.3 else 'Fair' if silhouette > 0.1 else 'Poor'})")
+print(f"   Balance: {min(cluster_counts)/max(cluster_counts):.3f} ({'Good' if min(cluster_counts)/max(cluster_counts) > 0.5 else 'Fair' if min(cluster_counts)/max(cluster_counts) > 0.3 else 'Poor'})")
+
+print("\n" + "="*60)
 
 # ──────────────────────────────────────────────────────────────────────────
 #%% 3. Train a separate NARX per cluster (with scaler per cluster).
@@ -440,18 +1004,16 @@ print(" NARX training done.")
 
 
 
-
-#%% -- store global metadata (helps inference script remain agnostic) --------
+#-- store global metadata (helps inference script remain agnostic) --------
 json.dump({'state_cols': STATE_COLS, 'exog_cols': EXOG_COLS, 'lag': LAG},
           (MODEL_DIR/'metadata.json').open('w'))
 
 
+
+
 #%%
-
-
-
 # ──────────────────────────────────────────────────────────────────────────
-# 4. Collect NARX validation residuals across *all* clusters  ➜  training
+## 4. Collect NARX validation residuals across *all* clusters  ➜  training
 #    set for Quantile-Regression nets.
 # --------------------------------------------------------------------------
 val_X, val_E = [], []

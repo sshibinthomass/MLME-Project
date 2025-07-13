@@ -19,20 +19,20 @@ import pandas as pd
 import tensorflow as tf
 import matplotlib.pyplot as plt
 from tqdm import trange
-#from sklearn.preprocessing import StandardScaler
-#from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # ──  Paths & runtime constants  ────────────────────────────────────────────
 TEST_DIR   = Path(r"Beat-the-Felix") #/Data/Test")
-MODEL_ROOT = Path(r"model_5files7")
+MODEL_ROOT = Path(r"model_5files10")  # Updated to match training script
 OUT_DIR    = MODEL_ROOT/"BEAT1"
 OUT_DIR.mkdir(exist_ok=True)
 
 # ----------  Load metadata to stay in sync with training  -----------------
 
 # --- Unit configuration ---------------------------------------------------
-#USE_MICRONS = False        # True  ➜ internally work in µm  
+USE_MICRONS = False        # True  ➜ internally work in µm  
 PSD_COLS    = ('d10', 'd50', 'd90')
 
 
@@ -51,7 +51,9 @@ print(f"[INFO]  LAG = {LAG},  horizon = {HORIZON}")
 def read_txt(p): return pd.read_csv(p, sep='\t', engine='python'
                                    ).apply(pd.to_numeric, errors='coerce')
 def clean_df(df):
-    df = df.dropna(subset=CLUST_COLS)
+    # Only process columns that are in CLUST_COLS (excludes constant variables)
+    available_cols = [col for col in CLUST_COLS if col in df.columns]
+    df = df.dropna(subset=available_cols)
     df = df[(df.T_PM.between(250,400)) & (df.T_TM.between(250,400))
             & (df.d10>0)&(df.d50>0)&(df.d90>0)
             & (df.mf_PM>=0)&(df.mf_TM>=0)&(df.Q_g>=0)]
@@ -62,19 +64,22 @@ def clean_iqr(df: pd.DataFrame) -> pd.DataFrame:
     Clear out outliers from data using IQR (Interquantile Range) method
     (Also includes extra steps to drop empty rows)
     """
-    df = df.dropna(subset=CLUST_COLS) #Drop empty rows
+    # Only process columns that are in CLUST_COLS (excludes constant variables)
+    available_cols = [col for col in CLUST_COLS if col in df.columns]
+    df = df.dropna(subset=available_cols) #Drop empty rows
 
     for column in df.columns:
-        Q1 = df[column].quantile(0.25)
-        Q3 = df[column].quantile(0.75)
-        IQR = Q3 - Q1
+        if column in available_cols:  # Only process relevant columns
+            Q1 = df[column].quantile(0.25)
+            Q3 = df[column].quantile(0.75)
+            IQR = Q3 - Q1
 
-        lower_bound = Q1 - 1.5*IQR
-        upper_bound = Q3 + 1.5*IQR
+            lower_bound = Q1 - 1.5*IQR
+            upper_bound = Q3 + 1.5*IQR
 
-        df[column] = df[column].apply(
-            lambda x: lower_bound if x < lower_bound else (upper_bound if x > upper_bound else x)
-        )
+            df[column] = df[column].apply(
+                lambda x: lower_bound if x < lower_bound else (upper_bound if x > upper_bound else x)
+            )
     return df
 
 #def harmonise_units(df):

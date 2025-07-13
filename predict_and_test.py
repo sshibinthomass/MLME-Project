@@ -8,6 +8,7 @@ This script provides functionality to:
 3. Test models on existing data
 4. Evaluate model performance with various metrics
 5. Generate prediction plots and analysis
+6. Export results to CSV files and graphs in a new folder for each run
 
 Author: Based on latest_modeltrain1.py training script
 """
@@ -36,7 +37,7 @@ np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
 # Configuration
-MODEL_DIR = Path("model_5files7")
+MODEL_DIR = Path("model_5files10")  # Updated to match training script
 PSD_COLS = ('d10', 'd50', 'd90')
 now = datetime.now().strftime("%Y%m%d_%H%M%S")
 # Load metadata
@@ -93,20 +94,22 @@ class NARXPredictor:
     
     def preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Preprocess data using the same method as training."""
-        # Clean data using IQR method
-        df = df.dropna(subset=CLUST_COLS)
+        # Clean data using IQR method - only process available columns
+        available_cols = [col for col in CLUST_COLS if col in df.columns]
+        df = df.dropna(subset=available_cols)
         
         for column in df.columns:
-            Q1 = df[column].quantile(0.25)
-            Q3 = df[column].quantile(0.75)
-            IQR = Q3 - Q1
-            
-            lower_bound = Q1 - 1.5 * IQR
-            upper_bound = Q3 + 1.5 * IQR
-            
-            df[column] = df[column].apply(
-                lambda x: lower_bound if x < lower_bound else (upper_bound if x > upper_bound else x)
-            )
+            if column in available_cols:  # Only process relevant columns
+                Q1 = df[column].quantile(0.25)
+                Q3 = df[column].quantile(0.75)
+                IQR = Q3 - Q1
+                
+                lower_bound = Q1 - 1.5 * IQR
+                upper_bound = Q3 + 1.5 * IQR
+                
+                df[column] = df[column].apply(
+                    lambda x: lower_bound if x < lower_bound else (upper_bound if x > upper_bound else x)
+                )
         
         return df
     
@@ -273,7 +276,113 @@ def read_txt(path: Path) -> pd.DataFrame:
     """Read TAB-separated text file into DataFrame."""
     return pd.read_csv(path, sep='\t', engine='python').apply(pd.to_numeric, errors='coerce')
 
-def test_on_file(predictor: NARXPredictor, file_path: Path, save_plots: bool = True) -> Dict:
+def export_metrics_to_csv(metrics_list: List[Dict], file_paths: List[Path], 
+                         output_dir: Path, timestamp: str):
+    """Export all metrics to CSV files."""
+    # Create output directory
+    output_dir.mkdir(exist_ok=True)
+    
+    # 1. Overall metrics per file
+    overall_data = []
+    for i, (metrics, file_path) in enumerate(zip(metrics_list, file_paths)):
+        if metrics:
+            row = {
+                'file_name': file_path.name,
+                'file_path': str(file_path),
+                'cluster_id': metrics.get('cluster_id', 'N/A'),
+                'num_predictions': metrics.get('num_predictions', 0),
+                'overall_r2': metrics.get('r2', 0),
+                'overall_rmse': metrics.get('rmse', 0),
+                'overall_mae': metrics.get('mae', 0),
+                'overall_mse': metrics.get('mse', 0),
+                'timestamp': timestamp
+            }
+            overall_data.append(row)
+    
+    if overall_data:
+        overall_df = pd.DataFrame(overall_data)
+        overall_csv_path = output_dir / f"overall_metrics_{timestamp}.csv"
+        overall_df.to_csv(overall_csv_path, index=False)
+        print(f"Exported overall metrics to: {overall_csv_path}")
+    
+    # 2. Per-column metrics per file
+    column_data = []
+    for i, (metrics, file_path) in enumerate(zip(metrics_list, file_paths)):
+        if metrics:
+            for col in STATE_COLS:
+                row = {
+                    'file_name': file_path.name,
+                    'file_path': str(file_path),
+                    'cluster_id': metrics.get('cluster_id', 'N/A'),
+                    'column': col,
+                    'r2': metrics.get(f'{col}_r2', 0),
+                    'rmse': metrics.get(f'{col}_rmse', 0),
+                    'mae': metrics.get(f'{col}_mae', 0),
+                    'mse': metrics.get(f'{col}_mse', 0),
+                    'timestamp': timestamp
+                }
+                column_data.append(row)
+    
+    if column_data:
+        column_df = pd.DataFrame(column_data)
+        column_csv_path = output_dir / f"column_metrics_{timestamp}.csv"
+        column_df.to_csv(column_csv_path, index=False)
+        print(f"Exported column metrics to: {column_csv_path}")
+    
+    # 3. Summary statistics
+    if overall_data:
+        summary_data = {
+            'metric': ['r2', 'rmse', 'mae', 'mse'],
+            'mean': [
+                np.mean([m.get('overall_r2', 0) for m in overall_data]),
+                np.mean([m.get('overall_rmse', 0) for m in overall_data]),
+                np.mean([m.get('overall_mae', 0) for m in overall_data]),
+                np.mean([m.get('overall_mse', 0) for m in overall_data])
+            ],
+            'std': [
+                np.std([m.get('overall_r2', 0) for m in overall_data]),
+                np.std([m.get('overall_rmse', 0) for m in overall_data]),
+                np.std([m.get('overall_mae', 0) for m in overall_data]),
+                np.std([m.get('overall_mse', 0) for m in overall_data])
+            ],
+            'min': [
+                np.min([m.get('overall_r2', 0) for m in overall_data]),
+                np.min([m.get('overall_rmse', 0) for m in overall_data]),
+                np.min([m.get('overall_mae', 0) for m in overall_data]),
+                np.min([m.get('overall_mse', 0) for m in overall_data])
+            ],
+            'max': [
+                np.max([m.get('overall_r2', 0) for m in overall_data]),
+                np.max([m.get('overall_rmse', 0) for m in overall_data]),
+                np.max([m.get('overall_mae', 0) for m in overall_data]),
+                np.max([m.get('overall_mse', 0) for m in overall_data])
+            ],
+            'timestamp': timestamp
+        }
+        
+        summary_df = pd.DataFrame(summary_data)
+        summary_csv_path = output_dir / f"summary_statistics_{timestamp}.csv"
+        summary_df.to_csv(summary_csv_path, index=False)
+        print(f"Exported summary statistics to: {summary_csv_path}")
+    
+    # 4. Cluster distribution
+    if overall_data:
+        cluster_counts = {}
+        for row in overall_data:
+            cluster_id = row.get('cluster_id', 'N/A')
+            cluster_counts[cluster_id] = cluster_counts.get(cluster_id, 0) + 1
+        
+        cluster_data = [
+            {'cluster_id': k, 'count': v, 'percentage': v/len(overall_data)*100, 'timestamp': timestamp}
+            for k, v in cluster_counts.items()
+        ]
+        
+        cluster_df = pd.DataFrame(cluster_data)
+        cluster_csv_path = output_dir / f"cluster_distribution_{timestamp}.csv"
+        cluster_df.to_csv(cluster_csv_path, index=False)
+        print(f"Exported cluster distribution to: {cluster_csv_path}")
+
+def test_on_file(predictor: NARXPredictor, file_path: Path, output_dir: Path, timestamp: str, save_plots: bool = True) -> Dict:
     """Test the predictor on a single file."""
     print(f"\nTesting on file: {file_path}")
     
@@ -290,6 +399,12 @@ def test_on_file(predictor: NARXPredictor, file_path: Path, save_plots: bool = T
     
     # Evaluate
     metrics = predictor.evaluate_predictions(Y_true, Y_pred)
+    
+    # Add additional metadata
+    metrics['cluster_id'] = cluster_id
+    metrics['num_predictions'] = len(Y_pred)
+    metrics['file_name'] = file_path.name
+    metrics['file_path'] = str(file_path)
     
     print(f"Cluster assigned: {cluster_id}")
     print(f"Number of predictions: {len(Y_pred)}")
@@ -321,23 +436,25 @@ def test_on_file(predictor: NARXPredictor, file_path: Path, save_plots: bool = T
     
     # Create plots
     if save_plots:
-        plots_dir = Path("prediction_plots")
-        plots_dir.mkdir(exist_ok=True)
-        
         file_name = file_path.stem
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         predictor.plot_predictions(Y_true, Y_pred, 
-                                 save_path=plots_dir / f"{file_name}_predictions_{timestamp}.png",
+                                 save_path=output_dir / f"{file_name}_predictions_{timestamp}.png",
                                  title=f"Predictions for {file_name}")
         
         predictor.plot_time_series(df_clean, Y_pred,
-                                 save_path=plots_dir / f"{file_name}_timeseries_{timestamp}.png")
+                                 save_path=output_dir / f"{file_name}_timeseries_{timestamp}.png")
     
     return metrics
 
 def main():
     """Main function to demonstrate prediction and testing."""
     print("=== NARX Model Prediction and Testing Script ===\n")
+    
+    # Create output directory for this run
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(f"NARX_Prediction/prediction_results_{timestamp}")
+    output_dir.mkdir(exist_ok=True)
+    print(f"Created output directory: {output_dir}")
     
     # Initialize predictor
     try:
@@ -346,6 +463,10 @@ def main():
         print(f"Error loading models: {e}")
         return
     
+    # Initialize lists to store results
+    all_metrics = []
+    all_file_paths = []
+    
     # Test on calibration data if available
     calib_dir = Path("Beat-the-Felix")
     if calib_dir.exists():
@@ -353,12 +474,11 @@ def main():
         calib_files = list(calib_dir.glob("*.txt"))
         
         if calib_files:
-            all_metrics = []
-            
             for file_path in calib_files[:5]:  # Test on first 5 files
-                metrics = test_on_file(predictor, file_path)
+                metrics = test_on_file(predictor, file_path, output_dir, timestamp)
                 if metrics:
                     all_metrics.append(metrics)
+                    all_file_paths.append(file_path)
             
             # Aggregate results
             if all_metrics:
@@ -369,13 +489,16 @@ def main():
                 print(f"Average R²: {avg_r2:.3f}")
                 print(f"Average RMSE: {avg_rmse:.6f}")
                 print(f"Average MAE: {avg_mae:.6f}")
+
     
-    # Test on a single file if provided
-    test_file = input("\nEnter path to a test file (or press Enter to skip): ").strip()
-    if test_file and Path(test_file).exists():
-        test_on_file(predictor, Path(test_file))
+    # Export results to CSV
+    if all_metrics:
+        print("\n=== Exporting Results to CSV ===")
+        export_metrics_to_csv(all_metrics, all_file_paths, output_dir, timestamp)
+        print(f"All results have been exported to: {output_dir}")
     
-    print("\n=== Prediction and Testing Complete ===")
+    print(f"\n=== Prediction and Testing Complete ===")
+    print(f"All outputs saved to: {output_dir}")
 
 if __name__ == "__main__":
     main() 
