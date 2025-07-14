@@ -52,7 +52,7 @@ tf.random.set_seed(SEED)
 
 # ──  User paths & global constants  ────────────────────────────────────────
 RAW_ROOT   = Path(r"Data/RAW DATA")
-MODEL_DIR  = Path(r"model_5files10") 
+MODEL_DIR  = Path(r"model_5files15") 
 # clean slate (avoids shape mismatches when you change LAG etc.)
 if MODEL_DIR.exists():
     shutil.rmtree(MODEL_DIR)
@@ -60,14 +60,19 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 (MODEL_DIR/"narx").mkdir()
 (MODEL_DIR/"qr").mkdir()
 
-LAG             = 25                # number of past steps
+LAG             = 40                # number of past steps
 N_CLUSTERS      = 2
 EPOCHS_NARX     = 300
 EPOCHS_QR       = 100
-BATCH_SIZE_NARX      = 16
+BATCH_SIZE_NARX      = 32
 BATCH_SIZE_QR       = 32
 QUANTILES       = [0.1, 0.9]
-OUTPUT_WEIGHTS  = np.array([8, 6, 25, 30, 35, 8], dtype="float32")  # higher weight to PSD (6 outputs)
+OUTPUT_WEIGHTS  = np.array([8, 6, 50, 60, 70, 8], dtype="float32") # higher weight to PSD (6 outputs)
+
+# Add early stopping configuration for NARX
+ES_PATIENCE_NARX = 8        # Reduced from 20
+ES_MIN_DELTA = 1e-6         # Minimum improvement threshold
+ES_RESTORE_BEST = True
 
 # Column layout  (matches report)
 STATE_COLS = ['T_PM', 'c', 'd10', 'd50', 'd90', 'T_TM']
@@ -104,8 +109,8 @@ def clean_iqr(df: pd.DataFrame) -> pd.DataFrame:
             Q3 = df[column].quantile(0.75)
             IQR = Q3 - Q1
 
-            lower_bound = Q1 - 1.5*IQR
-            upper_bound = Q3 + 1.5*IQR
+            lower_bound = Q1 - 2*IQR
+            upper_bound = Q3 + 2*IQR
 
             df[column] = df[column].apply(
                 lambda x: lower_bound if x < lower_bound else (upper_bound if x > upper_bound else x)
@@ -113,19 +118,6 @@ def clean_iqr(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-def to_metres(df):
-    """
-    Ensure d10 / d50 / d90 are in metres, regardless of the file’s unit.
-
-    Heuristic:
-        • If the column median is > 0.01  (i.e. larger than 1 cm)
-          the numbers must be µm  → divide by 1 × 10⁶.
-        • Otherwise they are already metres → leave untouched.
-    """
-    for col in PSD_COLS:
-        if df[col].median(skipna=True) > 1e-2:   # > 1 cm ⇒ µm
-            df[col] /= 1e6                       # µm → m
-    return df
 
 #def harmonise_units(df):
     """
@@ -160,7 +152,6 @@ def remove_trash_files(file_path_list):
 
 def preprocess(path: Path) -> pd.DataFrame:
     #df = clean_df(read_txt(path)) ##Used IQR method to clean data outliers
-    #df = to_metres(df)        # <<< make sure we are in metres  ## This is not needed anymore since we moved the trash data from the data directory
     df = clean_iqr(read_txt(path))
     return df
 
@@ -195,43 +186,54 @@ def weighted_mse(y_true, y_pred):
 def build_narx(input_dim: int, output_dim: int) -> tf.keras.Model:
     inputs = layers.Input(shape=(input_dim,))
     
-    # First layer
+    # First block
     x = layers.Dense(1024, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(5e-4))(inputs)
     x = layers.BatchNormalization()(x)
     x = layers.Dropout(0.4)(x)
     
-    # Second layer with residual connection
-    dense1 = layers.Dense(512, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(5e-4))(x)
-    dense1 = layers.BatchNormalization()(dense1)
-    dense1 = layers.Dropout(0.4)(dense1)
+    # Second block with residual connection (same size)
+    shortcut = x
+    x = layers.Dense(1024, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(5e-4))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.4)(x)
+    x = layers.Add()([shortcut, x])
     
-    # Residual connection (if dimensions match)
-    if x.shape[-1] == dense1.shape[-1]:
-        x = layers.Add()([x, dense1])
-    else:
-        x = dense1
+    # Third block with projection shortcut (1024 -> 768)
+    shortcut = x
+    x = layers.Dense(768, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(5e-4))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.35)(x)
+    shortcut_proj = layers.Dense(768)(shortcut)
+    x = layers.Add()([shortcut_proj, x])
     
-    # Third layer
-    dense2 = layers.Dense(256, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(5e-4))(x)
-    dense2 = layers.BatchNormalization()(dense2)
-    dense2 = layers.Dropout(0.3)(dense2)
+    # Fourth block with projection shortcut (768 -> 512)
+    shortcut = x
+    x = layers.Dense(512, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(5e-4))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.3)(x)
+    shortcut_proj = layers.Dense(512)(shortcut)
+    x = layers.Add()([shortcut_proj, x])
     
-    # Residual connection
-    if x.shape[-1] == dense2.shape[-1]:
-        x = layers.Add()([x, dense2])
-    else:
-        x = dense2
+    # Fifth block with projection shortcut (512 -> 256)
+    shortcut = x
+    x = layers.Dense(256, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(5e-4))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.25)(x)
+    shortcut_proj = layers.Dense(256)(shortcut)
+    x = layers.Add()([shortcut_proj, x])
     
-    # Fourth layer
+    # Sixth block with projection shortcut (256 -> 128)
+    shortcut = x
     x = layers.Dense(128, activation='selu', kernel_regularizer=tf.keras.regularizers.l2(5e-4))(x)
     x = layers.BatchNormalization()(x)
     x = layers.Dropout(0.2)(x)
+    shortcut_proj = layers.Dense(128)(shortcut)
+    x = layers.Add()([shortcut_proj, x])
     
     outputs = layers.Dense(output_dim)(x)
     
     return tf.keras.Model(inputs=inputs, outputs=outputs)
-# You can also try tuning BATCH_SIZE_NARX and dropout rates for further improvement.
-
+    
 def build_qr(input_dim: int) -> tf.keras.Model:
     inputs = layers.Input(shape=(input_dim,))
     
@@ -324,6 +326,27 @@ class WarmUpLearningRateScheduler(tf.keras.callbacks.Callback):
         if epoch < self.warmup_epochs:
             lr = self.initial_lr + (self.target_lr - self.initial_lr) * epoch / self.warmup_epochs
             self.model.optimizer.learning_rate.assign(lr)
+
+class ConvergenceCallback(tf.keras.callbacks.Callback):
+    def __init__(self, patience=3):
+        super().__init__()
+        self.patience = patience
+        self.wait = 0
+        self.best_loss = float('inf')
+        
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        current_loss = logs.get('val_loss', float('inf'))
+        
+        if current_loss < self.best_loss - ES_MIN_DELTA:
+            self.best_loss = current_loss
+            self.wait = 0
+        else:
+            self.wait += 1
+            
+        if self.wait >= self.patience:
+            print(f"\n🛑 Early stopping triggered after {epoch+1} epochs (no improvement for {self.patience} epochs)")
+            self.model.stop_training = True
 
 # ──────────────────────────────────────────────────────────────────────────
 # 1. Split RAW files once into *train* and *calibration* sub-folders.
@@ -930,8 +953,12 @@ print("\n" + "="*60)
 # ──────────────────────────────────────────────────────────────────────────
 #%% 3. Train a separate NARX per cluster (with scaler per cluster).
 # --------------------------------------------------------------------------
-print("\n Training per-cluster NARX models …")
+print("\n🔧 Phase 1: NARX Data Preprocessing and Preparation …")
+# Store preprocessed data for each cluster
+cluster_data = {}
+
 for cid in range(N_CLUSTERS):
+    print(f"\n📊 Preprocessing data for cluster {cid}...")
     Xc, Yc = [], []
     for idx, p in enumerate(train_files):
         if kmeans.labels_[idx] != cid:
@@ -939,13 +966,16 @@ for cid in range(N_CLUSTERS):
         x, y = make_xy(preprocess(p))
         if len(x):
             Xc.append(x); Yc.append(y)
+    
     if not Xc:
+        print(f"   ⚠️  No data found for cluster {cid}, skipping...")
         continue
 
     Xc = np.vstack(Xc);  Yc = np.vstack(Yc)
     scX = StandardScaler().fit(Xc)
     scY = StandardScaler().fit(Yc)
 
+    # Save scalers
     pickle.dump(scX, (MODEL_DIR/f'narx/scaler_X_{cid}.pkl').open('wb'))
     pickle.dump(scY, (MODEL_DIR/f'narx/scaler_Y_{cid}.pkl').open('wb'))
 
@@ -954,7 +984,33 @@ for cid in range(N_CLUSTERS):
     Xtr, Ytr = Xc[:split], Yc[:split]
     Xvl, Yvl = Xc[split:], Yc[split:]
 
-    model = build_narx(Xc.shape[1], Yc.shape[1])
+    # Store preprocessed data for training phase
+    cluster_data[cid] = {
+        'Xtr': Xtr, 'Ytr': Ytr,
+        'Xvl': Xvl, 'Yvl': Yvl,
+        'scX': scX, 'scY': scY,
+        'input_dim': Xc.shape[1],
+        'output_dim': Yc.shape[1]
+    }
+    
+    print(f"   ✅ Cluster {cid} preprocessing complete:")
+    print(f"      Training samples: {len(Xtr)}")
+    print(f"      Validation samples: {len(Xvl)}")
+    print(f"      Input dimension: {Xc.shape[1]}")
+    print(f"      Output dimension: {Yc.shape[1]}")
+
+print(f"\n✅ Phase 1 complete! Preprocessed data for {len(cluster_data)} clusters.")
+
+#%%
+print("\n🚀 Phase 2: NARX Model Training …")
+for cid, data in cluster_data.items():
+    print(f"\n🚀 Training NARX model for cluster {cid}")
+    print(f"   Training samples: {len(data['Xtr'])}")
+    print(f"   Validation samples: {len(data['Xvl'])}")
+    print(f"   Early stopping patience: {ES_PATIENCE_NARX} epochs")
+    print(f"   Min improvement threshold: {ES_MIN_DELTA}")
+
+    model = build_narx(data['input_dim'], data['output_dim'])
     model.compile(
         optimizer=tf.keras.optimizers.AdamW(
             learning_rate=1e-4, 
@@ -964,25 +1020,193 @@ for cid in range(N_CLUSTERS):
         loss=weighted_mse
     )
 
-    es = callbacks.EarlyStopping(patience=20, restore_best_weights=True)
+    # Optimized early stopping callbacks
+    es = callbacks.EarlyStopping(
+        patience=ES_PATIENCE_NARX, 
+        restore_best_weights=ES_RESTORE_BEST,
+        min_delta=ES_MIN_DELTA,
+        verbose=1
+    )
     ck = callbacks.ModelCheckpoint(
         filepath=MODEL_DIR/f'narx/cluster_{cid}.keras',
         monitor='val_loss',
-        save_best_only=True
+        save_best_only=True,
+        verbose=0  # Reduced verbosity
     )
     lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(
-        monitor='val_loss', factor=0.2, patience=4, min_lr=1e-6, verbose=1
+        monitor='val_loss', 
+        factor=0.2, 
+        patience=3,  # Reduced from 4
+        min_lr=1e-6, 
+        verbose=0,   # Reduced verbosity
+        min_delta=ES_MIN_DELTA
     )
     warmup_scheduler = WarmUpLearningRateScheduler(warmup_epochs=5)
     
+    # Add convergence callback
+    convergence_callback = ConvergenceCallback(patience=ES_PATIENCE_NARX)
+    
     history_narx = model.fit(
-        scX.transform(Xtr), scY.transform(Ytr),
-        validation_data=(scX.transform(Xvl), scY.transform(Yvl)),
+        data['scX'].transform(data['Xtr']), data['scY'].transform(data['Ytr']),
+        validation_data=(data['scX'].transform(data['Xvl']), data['scY'].transform(data['Yvl'])),
         epochs=EPOCHS_NARX,
         batch_size=BATCH_SIZE_NARX,
         verbose=1,
-        callbacks=[es, ck, PrintMetricsCallback(), lr_scheduler, warmup_scheduler]
+        callbacks=[es, ck, lr_scheduler, warmup_scheduler, convergence_callback]
     )
+
+    # Print training summary
+    best_epoch = np.argmin(history_narx.history['val_loss']) + 1
+    best_val_loss = min(history_narx.history['val_loss'])
+    final_epochs = len(history_narx.history['val_loss'])
+    
+    print(f"\n✅ Cluster {cid} training complete!")
+    print(f"   Best validation loss: {best_val_loss:.6f} at epoch {best_epoch}")
+    print(f"   Total epochs trained: {final_epochs}")
+    print(f"   Time saved: {EPOCHS_NARX - final_epochs} epochs")
+    
+    # Export detailed NARX training report
+    narx_report = {
+        'cluster_id': cid,
+        'training_summary': {
+            'total_training_samples': len(data['Xtr']),
+            'total_validation_samples': len(data['Xvl']),
+            'input_dimension': data['input_dim'],
+            'output_dimension': data['output_dim'],
+            'batch_size': BATCH_SIZE_NARX,
+            'max_epochs': EPOCHS_NARX,
+            'actual_epochs_trained': final_epochs,
+            'epochs_saved': EPOCHS_NARX - final_epochs,
+            'early_stopping_patience': ES_PATIENCE_NARX,
+            'min_improvement_threshold': ES_MIN_DELTA
+        },
+        'performance_metrics': {
+            'best_validation_loss': float(best_val_loss),
+            'best_epoch': best_epoch,
+            'final_training_loss': float(history_narx.history['loss'][-1]),
+            'final_validation_loss': float(history_narx.history['val_loss'][-1]),
+            'loss_improvement': float(history_narx.history['val_loss'][0] - best_val_loss),
+            'convergence_rate': float((history_narx.history['val_loss'][0] - best_val_loss) / best_val_loss * 100)
+        },
+        'training_history': {
+            'train_loss': [float(x) for x in history_narx.history['loss']],
+            'val_loss': [float(x) for x in history_narx.history['val_loss']],
+            'epochs': list(range(1, final_epochs + 1))
+        },
+        'model_architecture': {
+            'input_shape': data['input_dim'],
+            'output_shape': data['output_dim'],
+            'layers': [
+                {'type': 'Dense', 'units': 1024, 'activation': 'selu', 'dropout': 0.4},
+                {'type': 'Dense', 'units': 512, 'activation': 'selu', 'dropout': 0.4},
+                {'type': 'Dense', 'units': 256, 'activation': 'selu', 'dropout': 0.3},
+                {'type': 'Dense', 'units': 128, 'activation': 'selu', 'dropout': 0.2},
+                {'type': 'Dense', 'units': data['output_dim'], 'activation': 'linear'}
+            ],
+            'regularization': 'L2 (5e-4)',
+            'batch_normalization': True,
+            'residual_connections': True
+        },
+        'optimizer_config': {
+            'optimizer': 'AdamW',
+            'learning_rate': 1e-4,
+            'weight_decay': 1e-4,
+            'clipnorm': 1.0
+        },
+        'callbacks_used': [
+            'EarlyStopping',
+            'ModelCheckpoint', 
+            'ReduceLROnPlateau',
+            'WarmUpLearningRateScheduler',
+            'ConvergenceCallback'
+        ],
+        'data_preprocessing': {
+            'scaler_type': 'StandardScaler',
+            'train_samples': len(data['Xtr']),
+            'val_samples': len(data['Xvl']),
+            'input_features': len(STATE_COLS + EXOG_COLS) * (LAG + 1),
+            'output_features': len(STATE_COLS)
+        },
+        'convergence_analysis': {
+            'epochs_to_best': best_epoch,
+            'epochs_after_best': final_epochs - best_epoch,
+            'improvement_rate': float((history_narx.history['val_loss'][0] - best_val_loss) / best_epoch),
+            'plateau_detected': final_epochs - best_epoch > ES_PATIENCE_NARX,
+            'early_stopping_triggered': final_epochs < EPOCHS_NARX
+        }
+    }
+    
+    # Save detailed report
+    report_dir = MODEL_DIR / 'narx' / 'reports'
+    report_dir.mkdir(parents=True, exist_ok=True)
+    
+    report_file = report_dir / f'cluster_{cid}_narx_report.json'
+    with open(report_file, 'w') as f:
+        json.dump(narx_report, f, indent=2, default=str)
+    
+    # Create training curves plot
+    plt.figure(figsize=(12, 8))
+    
+    # Main plot
+    plt.subplot(2, 2, 1)
+    plt.plot(history_narx.history['loss'], label='Training Loss', color='blue', linewidth=2)
+    plt.plot(history_narx.history['val_loss'], label='Validation Loss', color='red', linewidth=2)
+    plt.axvline(x=best_epoch-1, color='green', linestyle='--', alpha=0.7, label=f'Best Epoch ({best_epoch})')
+    plt.xlabel('Epoch')
+    plt.ylabel('Weighted MSE Loss')
+    plt.title(f'NARX Training Curves - Cluster {cid}')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Loss improvement over time
+    plt.subplot(2, 2, 2)
+    initial_loss = history_narx.history['val_loss'][0]
+    loss_improvement = [initial_loss - loss for loss in history_narx.history['val_loss']]
+    plt.plot(loss_improvement, color='purple', linewidth=2)
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss Improvement')
+    plt.title('Validation Loss Improvement')
+    plt.grid(True, alpha=0.3)
+    
+    # Learning rate schedule (if available)
+    plt.subplot(2, 2, 3)
+    if 'lr' in history_narx.history:
+        plt.plot(history_narx.history['lr'], color='orange', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Learning Rate')
+        plt.title('Learning Rate Schedule')
+        plt.yscale('log')
+    else:
+        plt.text(0.5, 0.5, 'Learning Rate\nNot Tracked', ha='center', va='center', transform=plt.gca().transAxes)
+        plt.title('Learning Rate Schedule')
+    plt.grid(True, alpha=0.3)
+    
+    # Convergence analysis
+    plt.subplot(2, 2, 4)
+    epochs = range(1, final_epochs + 1)
+    plt.bar(epochs, history_narx.history['val_loss'], alpha=0.7, color='lightcoral')
+    plt.axhline(y=best_val_loss, color='green', linestyle='--', linewidth=2, label=f'Best Loss: {best_val_loss:.6f}')
+    plt.xlabel('Epoch')
+    plt.ylabel('Validation Loss')
+    plt.title('Convergence Analysis')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(report_dir / f'cluster_{cid}_narx_analysis.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # Print summary statistics
+    print(f"\n📊 Detailed Report Generated:")
+    print(f"   Report file: {report_file}")
+    print(f"   Analysis plot: {report_dir}/cluster_{cid}_narx_analysis.png")
+    print(f"   Loss improvement: {narx_report['performance_metrics']['loss_improvement']:.6f}")
+    print(f"   Convergence rate: {narx_report['performance_metrics']['convergence_rate']:.2f}%")
+    print(f"   Early stopping triggered: {narx_report['convergence_analysis']['early_stopping_triggered']}")
+    if narx_report['convergence_analysis']['plateau_detected']:
+        print(f"   ⚠️  Plateau detected - model stopped improving")
+    else:
+        print(f"   ✅ Model converged naturally")
 
 
     plt.figure()
@@ -997,7 +1221,7 @@ for cid in range(N_CLUSTERS):
     plt.close()
     print(f"Saved NARX loss curve for cluster {cid} to narx/cluster_{cid}_loss_curve.png")
 
-print(" NARX training done.")
+print("✅ NARX training complete.")
 
 
 
@@ -1058,12 +1282,8 @@ loss_dir.mkdir(parents=True, exist_ok=True)
 for j, col in enumerate(STATE_COLS):
     y_err = val_E_qr[:, j:j+1]      # residual for that state
     for q in QUANTILES:
-        if col in ['d50', 'd90']:
-            qr = build_deep_qr(val_X_qr.shape[1])
-        else:
-            qr = build_qr(val_X_qr.shape[1])
+        qr = build_deep_qr(val_X_qr.shape[1])
 
-        
         qr.compile(
             optimizer=tf.keras.optimizers.AdamW(
                 learning_rate=1e-4,

@@ -25,8 +25,8 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # ──  Paths & runtime constants  ────────────────────────────────────────────
 TEST_DIR   = Path(r"Beat-the-Felix") #/Data/Test")
-MODEL_ROOT = Path(r"model_5files10")  # Updated to match training script
-OUT_DIR    = MODEL_ROOT/"BEAT1"
+MODEL_ROOT = Path(r"model_5files13")  # Updated to match training script
+OUT_DIR    = MODEL_ROOT/"BEAT2"
 OUT_DIR.mkdir(exist_ok=True)
 
 # ----------  Load metadata to stay in sync with training  -----------------
@@ -228,10 +228,10 @@ for col in STATE_COLS:
                                                   compile=False)
 DELTAS = pickle.loads((MODEL_ROOT/'conformal_deltas.pkl').read_bytes())
 # Optional: Adjust deltas to improve coverage
-DELTAS['c']    *= 1.3
-DELTAS['d10']  *= 2.5
-DELTAS['d50']  *= 2.5
-DELTAS['d90']  *= 2.5
+DELTAS['c']    *= 2.3
+DELTAS['d10']  *= 3.5
+DELTAS['d50']  *= 3.5
+DELTAS['d90']  *= 3.5
 
 
 
