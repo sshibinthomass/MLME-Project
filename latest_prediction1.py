@@ -25,8 +25,8 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # ──  Paths & runtime constants  ────────────────────────────────────────────
 TEST_DIR   = Path(r"Beat-the-Felix") #/Data/Test")
-MODEL_ROOT = Path(r"model_5files13")  # Updated to match training script
-OUT_DIR    = MODEL_ROOT/"BEAT2"
+MODEL_ROOT = Path(r"Models/model_5files15")  # Updated to match training script
+OUT_DIR    = MODEL_ROOT/"BEAT3"
 OUT_DIR.mkdir(exist_ok=True)
 
 # ----------  Load metadata to stay in sync with training  -----------------
