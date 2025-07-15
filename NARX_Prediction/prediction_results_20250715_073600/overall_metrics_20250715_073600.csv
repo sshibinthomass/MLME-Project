@@ -1,0 +1,2 @@
+file_name,file_path,cluster_id,num_predictions,overall_r2,overall_rmse,overall_mae,overall_mse,timestamp
+file_12738.txt,Beat-the-Felix/file_12738.txt,0,979,0.757815420627594,0.10037607688729928,0.043609630316495895,0.010075356811285019,20250715_073600

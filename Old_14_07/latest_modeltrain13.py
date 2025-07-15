@@ -52,7 +52,7 @@ tf.random.set_seed(SEED)
 
 # ──  User paths & global constants  ────────────────────────────────────────
 RAW_ROOT   = Path(r"Data/RAW DATA")
-MODEL_DIR  = Path(r"model_5files16") 
+MODEL_DIR  = Path(r"model_5files18") 
 # clean slate (avoids shape mismatches when you change LAG etc.)
 if MODEL_DIR.exists():
     shutil.rmtree(MODEL_DIR)
@@ -60,14 +60,14 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 (MODEL_DIR/"narx").mkdir()
 (MODEL_DIR/"qr").mkdir()
 
-LAG             = 40                # number of past steps
+LAG             = 20                # number of past steps
 N_CLUSTERS      = 2
 EPOCHS_NARX     = 300
 EPOCHS_QR       = 100
 BATCH_SIZE_NARX      = 32
 BATCH_SIZE_QR       = 32
 QUANTILES       = [0.1, 0.9]
-OUTPUT_WEIGHTS  = np.array([10, 6,15, 20, 20,  10], dtype="float32") # higher weight to PSD (6 outputs)
+OUTPUT_WEIGHTS  = np.array([6, 8, 30, 30, 50, 10], dtype="float32") # higher weight to PSD (6 outputs)
 
 # Add early stopping configuration for NARX
 ES_PATIENCE_NARX = 8        # Reduced from 20
@@ -76,7 +76,8 @@ ES_RESTORE_BEST = True
 
 # Column layout  (matches report)
 STATE_COLS = ['T_PM', 'c', 'd10', 'd50', 'd90', 'T_TM']
-EXOG_COLS  = ['mf_PM', 'mf_TM', 'Q_g', 'w_crystal']  # Removed constant variables
+EXOG_COLS  = ['mf_PM', 'mf_TM', 'Q_g', 'w_crystal',
+              'c_in', 'T_PM_in', 'T_TM_in'] # Removed constant variables
 OUTPUT_COLS = STATE_COLS
 CLUST_COLS  = STATE_COLS + EXOG_COLS
 
@@ -96,48 +97,94 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
 
 def clean_iqr(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Clear out outliers from data using IQR (Interquantile Range) method
-    (Also includes extra steps to drop empty rows)
+    Improved: 
+      - Log-transform d10/d50/d90 before outlier handling
+      - Use stricter IQR (1.5x) for d10/d50/d90
+      - Add engineered features after cleaning
     """
-    # Only process columns that are in CLUST_COLS (excludes constant variables)
     available_cols = [col for col in CLUST_COLS if col in df.columns]
     df = df.dropna(subset=available_cols) #Drop empty rows
 
+    # Log-transform d10/d50/d90 before outlier handling
+    for col in ['d10', 'd50', 'd90']:
+        if col in df.columns:
+            df[col] = np.log1p(df[col])
+
     for column in df.columns:
-        if column in available_cols:  # Only process relevant columns
+        if column in available_cols:
             Q1 = df[column].quantile(0.25)
             Q3 = df[column].quantile(0.75)
             IQR = Q3 - Q1
 
-            lower_bound = Q1 - 1.5*IQR
-            upper_bound = Q3 + 1.5*IQR
+            if column in ['T_PM', 'T_TM']:
+                lower_bound = Q1 - 3.0 * IQR
+                upper_bound = Q3 + 3.0 * IQR
+                vals = df[column].values.copy()
+                for i in range(len(vals)):
+                    if not (lower_bound <= vals[i] <= upper_bound):
+                        prev_idx = i - 1
+                        while prev_idx >= 0 and not (lower_bound <= vals[prev_idx] <= upper_bound):
+                            prev_idx -= 1
+                        next_idx = i + 1
+                        while next_idx < len(vals) and not (lower_bound <= vals[next_idx] <= upper_bound):
+                            next_idx += 1
+                        if prev_idx >= 0 and next_idx < len(vals):
+                            vals[i] = 0.5 * (vals[prev_idx] + vals[next_idx])
+                        elif prev_idx >= 0:
+                            vals[i] = vals[prev_idx]
+                        elif next_idx < len(vals):
+                            vals[i] = vals[next_idx]
+                df[column] = vals
+            elif column == 'c':
+                lower_bound = Q1 - 6.0 * IQR
+                upper_bound = Q3 + 6.0 * IQR
+                vals = df[column].values.copy()
+                mask = ~((lower_bound <= vals) & (vals <= upper_bound))
+                i = 0
+                n = len(vals)
+                while i < n:
+                    if mask[i]:
+                        run_start = i
+                        while i < n and mask[i]:
+                            i += 1
+                        run_end = i
+                        prev_idx = run_start - 1
+                        next_idx = run_end
+                        prev_val = vals[prev_idx] if prev_idx >= 0 else None
+                        next_val = vals[next_idx] if next_idx < n else None
+                        if prev_val is not None and next_val is not None:
+                            for j in range(run_start, run_end):
+                                alpha = (j - run_start + 1) / (run_end - run_start + 1)
+                                vals[j] = (1 - alpha) * prev_val + alpha * next_val
+                        elif prev_val is not None:
+                            vals[run_start:run_end] = prev_val
+                        elif next_val is not None:
+                            vals[run_start:run_end] = next_val
+                    else:
+                        i += 1
+                df[column] = vals
+            elif column in ['d10', 'd50', 'd90']:
+                lower_bound = Q1 - 1.5 * IQR
+                upper_bound = Q3 + 1.5 * IQR
+                df[column] = df[column].clip(lower=lower_bound, upper=upper_bound)
+            else:
+                lower_bound = Q1 - 2 * IQR
+                upper_bound = Q3 + 2 * IQR
+                df[column] = df[column].apply(
+                    lambda x: lower_bound if x < lower_bound else (upper_bound if x > upper_bound else x)
+                )
 
-            df[column] = df[column].apply(
-                lambda x: lower_bound if x < lower_bound else (upper_bound if x > upper_bound else x)
-            )
+    # Add engineered features (span, ratios) in original scale
+    if all(col in df.columns for col in ['d10', 'd50', 'd90']):
+        d10 = np.expm1(df['d10'])
+        d50 = np.expm1(df['d50'])
+        d90 = np.expm1(df['d90'])
+        df['span_d90_d10'] = d90 - d10
+        df['ratio_d90_d50'] = d90 / d50.replace(0, np.nan)
+        df['ratio_d50_d10'] = d50 / d10.replace(0, np.nan)
 
     return df
 
-
-#def harmonise_units(df):
-    """
-    Make sure d10 / d50 / d90 are in *micrometres*.
-
-    Rule:
-        • If the median of a column is smaller than 1 × 10⁻² (i.e. < 1 cm)
-          the data must already be in metres  ➜  multiply by 1 × 10⁶.
-        • Otherwise assume it is already µm and leave unchanged.
-
-    Works row-wise, so mixed units inside the same file are also fixed.
-    """
-    if not USE_MICRONS:
-        return df    # fall-back for future experiments
-
-    for col in PSD_COLS:
-        median = df[col].median(skipna=True)
-        if median < 1e-2:         # < 1 cm  ⇒ data were metres
-            df[col] *= 1e6        # m → µm
-    return df
 
 def remove_trash_files(file_path_list):
     """
@@ -151,7 +198,6 @@ def remove_trash_files(file_path_list):
 
 
 def preprocess(path: Path) -> pd.DataFrame:
-    #df = clean_df(read_txt(path)) ##Used IQR method to clean data outliers
     df = clean_iqr(read_txt(path))
     return df
 
@@ -974,7 +1020,23 @@ for cid in range(N_CLUSTERS):
 
 print(f"\n✅ Phase 1 complete! Preprocessed data for {len(cluster_data)} clusters.")
 
+# --- Export cluster_data to pickle for later use ---
+import pickle
+cluster_data_path = MODEL_DIR / 'narx' / 'cluster_data.pkl'
+with open(cluster_data_path, 'wb') as f:
+    pickle.dump(cluster_data, f)
+print(f"cluster_data exported to {cluster_data_path}")
+
 #%%
+# --- Import cluster_data if exists, else use freshly created ---
+import os
+if os.path.exists(cluster_data_path):
+    with open(cluster_data_path, 'rb') as f:
+        cluster_data = pickle.load(f)
+    print(f"cluster_data loaded from {cluster_data_path}")
+else:
+    print("cluster_data.pkl not found, using freshly created cluster_data.")
+
 print("\n🚀 Phase 2: NARX Model Training …")
 for cid, data in cluster_data.items():
     print(f"\n🚀 Training NARX model for cluster {cid}")
@@ -1196,8 +1258,40 @@ for cid, data in cluster_data.items():
 
 print("✅ NARX training complete.")
 
+# Collect loss histories for all clusters
+narx_histories = {}
+for cid in cluster_data.keys():
+    report_dir = MODEL_DIR / 'narx' / 'reports'
+    report_file = report_dir / f'cluster_{cid}_narx_report.json'
+    if report_file.exists():
+        with open(report_file, 'r') as f:
+            narx_report = json.load(f)
+        narx_histories[cid] = {
+            'train_loss': narx_report['training_history']['train_loss'],
+            'val_loss': narx_report['training_history']['val_loss'],
+            'epochs': narx_report['training_history']['epochs']
+        }
 
-
+# Plot side-by-side loss curves
+if len(narx_histories) == 2:
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
+    for idx, cid in enumerate(sorted(narx_histories.keys())):
+        ax = axes[idx]
+        hist = narx_histories[cid]
+        ax.plot(hist['epochs'], hist['train_loss'], label='Train Loss', color='blue')
+        ax.plot(hist['epochs'], hist['val_loss'], label='Validation Loss', color='red')
+        ax.set_title(f'NARX Loss Curve (Cluster {cid})')
+        ax.set_xlabel('Epoch')
+        if idx == 0:
+            ax.set_ylabel('Weighted MSE Loss')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(MODEL_DIR / 'narx/narx_loss_curves_side_by_side.png', dpi=150)
+    plt.close()
+    print("Saved side-by-side NARX loss curves to narx/narx_loss_curves_side_by_side.png")
+else:
+    print("Side-by-side plot only supported for exactly 2 clusters.")
 
 
 
@@ -1213,30 +1307,60 @@ json.dump({'state_cols': STATE_COLS, 'exog_cols': EXOG_COLS, 'lag': LAG},
 ## 4. Collect NARX validation residuals across *all* clusters  ➜  training
 #    set for Quantile-Regression nets.
 # --------------------------------------------------------------------------
+print("\nCollecting NARX validation residuals for QR training ...")
 val_X, val_E = [], []
+
+# Map each file to its cluster using the same logic as in clustering
+file_to_cluster = {}
+for idx, p in enumerate(train_files):
+    # Use the same feature extraction as in clustering
+    arr = preprocess(p)[CLUST_COLS].values
+    feat_vec = np.concatenate([arr.mean(0), arr.std(0), arr.min(0), arr.max(0)])
+    sig = sc_feat.transform([feat_vec])
+    cluster_id = int(kmeans.predict(sig)[0])
+    file_to_cluster[p] = cluster_id
+
+# For each cluster, collect residuals from files assigned to that cluster
 for cid in range(N_CLUSTERS):
     scaler_x = pickle.loads((MODEL_DIR/f'narx/scaler_X_{cid}.pkl').read_bytes())
     scaler_y = pickle.loads((MODEL_DIR/f'narx/scaler_Y_{cid}.pkl').read_bytes())
     narx     = tf.keras.models.load_model(MODEL_DIR/f'narx/cluster_{cid}.keras',
                                           compile=False)
-
-    for p in train_files:
-        # predict cluster id directly from already-computed feature → faster
-        sig = sc_feat.transform([feat[kmeans.labels_ == cid][0]])  # re-use stats
-        if kmeans.predict(sig)[0] != cid:
-            continue
-
+    files_in_cluster = [p for p, c in file_to_cluster.items() if c == cid]
+    print(f"  Cluster {cid}: {len(files_in_cluster)} files")
+    for p in files_in_cluster:
         X, Y = make_xy(preprocess(p))
         if not len(X):
             continue
-
         y_hat = scaler_y.inverse_transform(
                     narx.predict(scaler_x.transform(X), verbose=0))
         val_X.append(scaler_x.transform(X))
         val_E.append(Y - y_hat)
 
+if len(val_X) == 0 or len(val_E) == 0:
+    raise RuntimeError("No validation data collected for QR training. Check preprocessing and data files.")
+
 val_X = np.vstack(val_X)
 val_E = np.vstack(val_E)
+print(f"Collected {val_X.shape[0]} validation samples for QR training.")
+
+# --- Export QR preprocessing data (val_X, val_E) to pickle for later use ---
+qr_data_path = MODEL_DIR / 'qr' / 'qr_preprocessed_data.pkl'
+with open(qr_data_path, 'wb') as f:
+    pickle.dump({'val_X': val_X, 'val_E': val_E}, f)
+print(f"QR preprocessing data exported to {qr_data_path}")
+
+# --- Import QR preprocessing data if exists, else use freshly created ---
+import os
+if os.path.exists(qr_data_path):
+    with open(qr_data_path, 'rb') as f:
+        qr_data = pickle.load(f)
+    val_X = qr_data['val_X']
+    val_E = qr_data['val_E']
+    print(f"QR preprocessing data loaded from {qr_data_path}")
+else:
+    print("qr_preprocessed_data.pkl not found, using freshly created val_X and val_E.")
+
 
 # ──────────────────────────────────────────────────────────────────────────
 #%% 5. Train Quantile-Regression nets (τ = 0.1 & 0.9) on residuals.
@@ -1267,7 +1391,7 @@ for j, col in enumerate(STATE_COLS):
         )
 
         es_qr = callbacks.EarlyStopping(
-            patience=15,
+            patience=8,
             restore_best_weights=True,
             monitor="val_loss"
         )
@@ -1302,7 +1426,41 @@ for j, col in enumerate(STATE_COLS):
         plt.savefig(loss_dir / f"{col}_{q:.1f}_loss.png", dpi=150)
         plt.close()
 
+        # --- Collect loss histories for combined plot ---
+        if 'qr_loss_histories' not in globals():
+            qr_loss_histories = {}
+        qr_loss_histories[(col, q)] = {
+            'loss': history_qr.history['loss'],
+            'val_loss': history_qr.history['val_loss']
+        }
+
 print(" QR nets done.")
+
+# --- Plot all QR loss curves in a single image ---
+try:
+    n_rows = len(STATE_COLS)
+    n_cols = len(QUANTILES)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 4 * n_rows), sharex=True, sharey=True)
+    for i, col in enumerate(STATE_COLS):
+        for j, q in enumerate(QUANTILES):
+            ax = axes[i, j] if n_rows > 1 else axes[j]
+            hist = qr_loss_histories.get((col, q))
+            if hist:
+                ax.plot(hist['loss'], label='Train Loss', color='blue')
+                ax.plot(hist['val_loss'], label='Validation Loss', color='red')
+                ax.set_title(f"{col}  τ={q:.1f}")
+                ax.set_xlabel('Epoch')
+                ax.set_ylabel('Pinball Loss')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+            else:
+                ax.set_visible(False)
+    plt.tight_layout()
+    plt.savefig(MODEL_DIR / 'qr/qr_loss_curves_all.png', dpi=150)
+    plt.close()
+    print("Saved all QR loss curves to qr/qr_loss_curves_all.png")
+except Exception as e:
+    print(f"Could not create combined QR loss plot: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────

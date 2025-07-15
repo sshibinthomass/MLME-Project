@@ -37,7 +37,7 @@ np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
 # Configuration
-MODEL_DIR = Path("model_5files13")  # Updated to match training script
+MODEL_DIR = Path("model_5files18")  # Updated to match training script
 PSD_COLS = ('d10', 'd50', 'd90')
 now = datetime.now().strftime("%Y%m%d_%H%M%S")
 # Load metadata
@@ -93,24 +93,87 @@ class NARXPredictor:
         print(f"Loaded {self.n_clusters} NARX models successfully")
     
     def preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Preprocess data using the same method as training."""
-        # Clean data using IQR method - only process available columns
+        """Preprocess data using the same method as training (improved)."""
         available_cols = [col for col in CLUST_COLS if col in df.columns]
         df = df.dropna(subset=available_cols)
-        
+
+        # Log-transform d10/d50/d90 before outlier handling
+        for col in ['d10', 'd50', 'd90']:
+            if col in df.columns:
+                df[col] = np.log1p(df[col])
+
         for column in df.columns:
-            if column in available_cols:  # Only process relevant columns
+            if column in available_cols:
                 Q1 = df[column].quantile(0.25)
                 Q3 = df[column].quantile(0.75)
                 IQR = Q3 - Q1
-                
-                lower_bound = Q1 - 1.5 * IQR
-                upper_bound = Q3 + 1.5 * IQR
-                
-                df[column] = df[column].apply(
-                    lambda x: lower_bound if x < lower_bound else (upper_bound if x > upper_bound else x)
-                )
-        
+                if column in ['T_PM', 'T_TM']:
+                    lower_bound = Q1 - 3.0 * IQR
+                    upper_bound = Q3 + 3.0 * IQR
+                    vals = df[column].values.copy()
+                    for i in range(len(vals)):
+                        if not (lower_bound <= vals[i] <= upper_bound):
+                            prev_idx = i - 1
+                            while prev_idx >= 0 and not (lower_bound <= vals[prev_idx] <= upper_bound):
+                                prev_idx -= 1
+                            next_idx = i + 1
+                            while next_idx < len(vals) and not (lower_bound <= vals[next_idx] <= upper_bound):
+                                next_idx += 1
+                            if prev_idx >= 0 and next_idx < len(vals):
+                                vals[i] = 0.5 * (vals[prev_idx] + vals[next_idx])
+                            elif prev_idx >= 0:
+                                vals[i] = vals[prev_idx]
+                            elif next_idx < len(vals):
+                                vals[i] = vals[next_idx]
+                    df[column] = vals
+                elif column == 'c':
+                    lower_bound = Q1 - 6.0 * IQR
+                    upper_bound = Q3 + 6.0 * IQR
+                    vals = df[column].values.copy()
+                    mask = ~((lower_bound <= vals) & (vals <= upper_bound))
+                    i = 0
+                    n = len(vals)
+                    while i < n:
+                        if mask[i]:
+                            run_start = i
+                            while i < n and mask[i]:
+                                i += 1
+                            run_end = i
+                            prev_idx = run_start - 1
+                            next_idx = run_end
+                            prev_val = vals[prev_idx] if prev_idx >= 0 else None
+                            next_val = vals[next_idx] if next_idx < n else None
+                            if prev_val is not None and next_val is not None:
+                                for j in range(run_start, run_end):
+                                    alpha = (j - run_start + 1) / (run_end - run_start + 1)
+                                    vals[j] = (1 - alpha) * prev_val + alpha * next_val
+                            elif prev_val is not None:
+                                vals[run_start:run_end] = prev_val
+                            elif next_val is not None:
+                                vals[run_start:run_end] = next_val
+                        else:
+                            i += 1
+                    df[column] = vals
+                elif column in ['d10', 'd50', 'd90']:
+                    lower_bound = Q1 - 1.5 * IQR
+                    upper_bound = Q3 + 1.5 * IQR
+                    df[column] = df[column].clip(lower=lower_bound, upper=upper_bound)
+                else:
+                    lower_bound = Q1 - 2 * IQR
+                    upper_bound = Q3 + 2 * IQR
+                    df[column] = df[column].apply(
+                        lambda x: lower_bound if x < lower_bound else (upper_bound if x > upper_bound else x)
+                    )
+
+        # Add engineered features (span, ratios) in original scale
+        if all(col in df.columns for col in ['d10', 'd50', 'd90']):
+            d10 = np.expm1(df['d10'])
+            d50 = np.expm1(df['d50'])
+            d90 = np.expm1(df['d90'])
+            df['span_d90_d10'] = d90 - d10
+            df['ratio_d90_d50'] = d90 / d50.replace(0, np.nan)
+            df['ratio_d50_d10'] = d50 / d10.replace(0, np.nan)
+
         return df
     
     def make_xy(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
