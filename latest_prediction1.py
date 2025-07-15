@@ -25,7 +25,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # ──  Paths & runtime constants  ────────────────────────────────────────────
 TEST_DIR   = Path(r"Beat-the-Felix") #/Data/Test")
-MODEL_ROOT = Path(r"Models/model_5files15")  # Updated to match training script
+MODEL_ROOT = Path(r"model_5files17")  # Updated to match training script
 OUT_DIR    = MODEL_ROOT/"BEAT3"
 OUT_DIR.mkdir(exist_ok=True)
 
@@ -61,25 +61,92 @@ def clean_df(df):
 
 def clean_iqr(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Clear out outliers from data using IQR (Interquantile Range) method
-    (Also includes extra steps to drop empty rows)
+    Improved: 
+      - Log-transform d10/d50/d90 before outlier handling
+      - Use stricter IQR (1.5x) for d10/d50/d90
+      - Add engineered features after cleaning
     """
-    # Only process columns that are in CLUST_COLS (excludes constant variables)
     available_cols = [col for col in CLUST_COLS if col in df.columns]
     df = df.dropna(subset=available_cols) #Drop empty rows
 
+    # Log-transform d10/d50/d90 before outlier handling
+    for col in ['d10', 'd50', 'd90']:
+        if col in df.columns:
+            df[col] = np.log1p(df[col])
+
     for column in df.columns:
-        if column in available_cols:  # Only process relevant columns
+        if column in available_cols:
             Q1 = df[column].quantile(0.25)
             Q3 = df[column].quantile(0.75)
             IQR = Q3 - Q1
 
-            lower_bound = Q1 - 1.5*IQR
-            upper_bound = Q3 + 1.5*IQR
+            if column in ['T_PM', 'T_TM']:
+                lower_bound = Q1 - 3.0 * IQR
+                upper_bound = Q3 + 3.0 * IQR
+                vals = df[column].values.copy()
+                for i in range(len(vals)):
+                    if not (lower_bound <= vals[i] <= upper_bound):
+                        prev_idx = i - 1
+                        while prev_idx >= 0 and not (lower_bound <= vals[prev_idx] <= upper_bound):
+                            prev_idx -= 1
+                        next_idx = i + 1
+                        while next_idx < len(vals) and not (lower_bound <= vals[next_idx] <= upper_bound):
+                            next_idx += 1
+                        if prev_idx >= 0 and next_idx < len(vals):
+                            vals[i] = 0.5 * (vals[prev_idx] + vals[next_idx])
+                        elif prev_idx >= 0:
+                            vals[i] = vals[prev_idx]
+                        elif next_idx < len(vals):
+                            vals[i] = vals[next_idx]
+                df[column] = vals
+            elif column == 'c':
+                lower_bound = Q1 - 6.0 * IQR
+                upper_bound = Q3 + 6.0 * IQR
+                vals = df[column].values.copy()
+                mask = ~((lower_bound <= vals) & (vals <= upper_bound))
+                i = 0
+                n = len(vals)
+                while i < n:
+                    if mask[i]:
+                        run_start = i
+                        while i < n and mask[i]:
+                            i += 1
+                        run_end = i
+                        prev_idx = run_start - 1
+                        next_idx = run_end
+                        prev_val = vals[prev_idx] if prev_idx >= 0 else None
+                        next_val = vals[next_idx] if next_idx < n else None
+                        if prev_val is not None and next_val is not None:
+                            for j in range(run_start, run_end):
+                                alpha = (j - run_start + 1) / (run_end - run_start + 1)
+                                vals[j] = (1 - alpha) * prev_val + alpha * next_val
+                        elif prev_val is not None:
+                            vals[run_start:run_end] = prev_val
+                        elif next_val is not None:
+                            vals[run_start:run_end] = next_val
+                    else:
+                        i += 1
+                df[column] = vals
+            elif column in ['d10', 'd50', 'd90']:
+                lower_bound = Q1 - 1.5 * IQR
+                upper_bound = Q3 + 1.5 * IQR
+                df[column] = df[column].clip(lower=lower_bound, upper=upper_bound)
+            else:
+                lower_bound = Q1 - 2 * IQR
+                upper_bound = Q3 + 2 * IQR
+                df[column] = df[column].apply(
+                    lambda x: lower_bound if x < lower_bound else (upper_bound if x > upper_bound else x)
+                )
 
-            df[column] = df[column].apply(
-                lambda x: lower_bound if x < lower_bound else (upper_bound if x > upper_bound else x)
-            )
+    # Add engineered features (span, ratios) in original scale
+    if all(col in df.columns for col in ['d10', 'd50', 'd90']):
+        d10 = np.expm1(df['d10'])
+        d50 = np.expm1(df['d50'])
+        d90 = np.expm1(df['d90'])
+        df['span_d90_d10'] = d90 - d10
+        df['ratio_d90_d50'] = d90 / d50.replace(0, np.nan)
+        df['ratio_d50_d10'] = d50 / d10.replace(0, np.nan)
+
     return df
 
 #def harmonise_units(df):
@@ -220,30 +287,73 @@ def predict_open(df, scX, scY, narx):
     y_pred = scY.inverse_transform(narx.predict(Xs, verbose=0))
     return df.iloc[LAG+1:].reset_index(drop=True), Xs, y_pred
 
-#%% ──  QR nets & conformal deltas  ───────────────────────────────────────────
+#%% ──  Enhanced QR nets & conformal deltas  ───────────────────────────────────────────
 QR = {}
 for col in STATE_COLS:
     for q in (0.1, 0.9):
         QR[(col, q)] = tf.keras.models.load_model(MODEL_ROOT/f'qr/{col}_{q:.1f}.keras',
                                                   compile=False)
-DELTAS = pickle.loads((MODEL_ROOT/'conformal_deltas.pkl').read_bytes())
-# Optional: Adjust deltas to improve coverage
-DELTAS['c']    *= 2.3
-DELTAS['d10']  *= 3.5
-DELTAS['d50']  *= 3.5
-DELTAS['d90']  *= 3.5
 
+# Load enhanced conformal deltas
+try:
+    # Try to load enhanced deltas first
+    delta_results = pickle.loads((MODEL_ROOT/'enhanced_conformal_deltas.pkl').read_bytes())
+    DELTAS = delta_results['enhanced']
+    print("Loaded enhanced conformal deltas")
+except:
+    # Fallback to basic deltas
+    DELTAS = pickle.loads((MODEL_ROOT/'conformal_deltas.pkl').read_bytes())
+    print("Loaded basic conformal deltas")
 
+# Optional: Adjust deltas to improve coverage (enhanced version)
+def adjust_deltas_adaptive(deltas, df, Xs, base_pred):
+    """Adaptively adjust deltas based on prediction uncertainty."""
+    adjusted_deltas = deltas.copy()
+    
+    for col in STATE_COLS:
+        if col in deltas:
+            # Calculate prediction uncertainty
+            pred_std = np.std(base_pred[:, STATE_COLS.index(col)])
+            pred_mean = np.mean(base_pred[:, STATE_COLS.index(col)])
+            
+            # Adjust delta based on prediction variability
+            if pred_mean > 0:
+                uncertainty_factor = 1.0 + 0.3 * (pred_std / pred_mean)
+                adjusted_deltas[col] = deltas[col] * uncertainty_factor
+    
+    return adjusted_deltas
 
-def add_cqr(df, Xs, base_pred, mode: str):
-   # Attach point-pred + CQR bounds to DataFrame."""
+# Apply adaptive delta adjustment
+DELTAS = adjust_deltas_adaptive(DELTAS, None, None, None)
+
+def add_enhanced_cqr(df, Xs, base_pred, mode: str):
+    """Enhanced CQR with better uncertainty quantification."""
     out = df.copy()
+    
     for i, col in enumerate(STATE_COLS):
+        # Get quantile predictions
         lo = QR[(col, 0.1)].predict(Xs, verbose=0).flatten()
         hi = QR[(col, 0.9)].predict(Xs, verbose=0).flatten()
-        out[f"{col}_{mode}"]    = base_pred[:, i]
-        out[f"{col}_{mode}_lo"] = base_pred[:, i] - lo - DELTAS[col]
-        out[f"{col}_{mode}_hi"] = base_pred[:, i] + hi + DELTAS[col]
+        
+        # Calculate prediction uncertainty
+        pred_uncertainty = hi - lo
+        
+        # Enhanced delta calculation
+        base_delta = DELTAS.get(col, 0.0)
+        
+        # Adaptive delta based on prediction uncertainty
+        adaptive_factor = 1.0 + 0.2 * (pred_uncertainty / np.mean(pred_uncertainty))
+        adaptive_delta = base_delta * adaptive_factor
+        
+        # Store predictions
+        out[f"{col}_{mode}"] = base_pred[:, i]
+        out[f"{col}_{mode}_lo"] = base_pred[:, i] - lo - adaptive_delta
+        out[f"{col}_{mode}_hi"] = base_pred[:, i] + hi + adaptive_delta
+        
+        # Additional uncertainty metrics
+        out[f"{col}_{mode}_uncertainty"] = pred_uncertainty
+        out[f"{col}_{mode}_delta"] = adaptive_delta
+    
     return out
 
 # ──  Metrics helper  ───────────────────────────────────────────────────────
@@ -305,11 +415,11 @@ for p in sorted(TEST_DIR.glob("*.txt")):
 
         # 2. open-loop
         df_o, Xo_s, y_open = predict_open( df, scX, scY, narx)
-        df_o = add_cqr(df_o, Xo_s, y_open, mode="open")
+        df_o = add_enhanced_cqr(df_o, Xo_s, y_open, mode="open")
 
         # 3. closed-loop
         df_c, Xc_s, y_closed = predict_closed(df, scX, scY, narx, HORIZON)
-        df_c = add_cqr(df_c, Xc_s, y_closed, mode="closed")
+        df_c = add_enhanced_cqr(df_c, Xc_s, y_closed, mode="closed")
 
         # 4. merge
         df_pred = pd.concat(

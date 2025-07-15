@@ -1,0 +1,10 @@
+Preprocessing-AAdithya
+Clustering-Aadithya
+
+NARX-Shibin
+
+CQR-Sankar
+
+beat-Nishit
+Prediction-Nishit
+additional task-Nishit
