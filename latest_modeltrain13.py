@@ -5,7 +5,6 @@ Nishitkumar Karkar
 Sankar Nair
 Aadhithya Krishnakumar
 
-
 End-to-end training script for the SFC project (Machine Learning Methods for
 Engineers, SS 25).
 
@@ -24,6 +23,7 @@ Key features
 """
 
 #%% ──  Imports  ──────────────────────────────────────────────────────────────
+# Standard and scientific imports
 from __future__ import annotations
 
 import os, random, json, pickle, shutil
@@ -39,11 +39,11 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 
 #%% --- Unit configuration ---------------------------------------------------
-#USE_MICRONS = False        # True  ➜ internally work in µm  (recommended by you)
+# Define which columns are used for PSD (Particle Size Distribution)
 PSD_COLS    = ('d10', 'd50', 'd90')
 
-
 # ──  Reproducibility  ──────────────────────────────────────────────────────
+# Set seeds for reproducibility across all libraries
 SEED = 42
 os.environ["PYTHONHASHSEED"] = str(SEED)
 random.seed(SEED)
@@ -51,41 +51,46 @@ np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
 # ──  User paths & global constants  ────────────────────────────────────────
+# Define data and model directories
 RAW_ROOT   = Path(r"Data/RAW DATA")
-MODEL_DIR  = Path(r"model_5files16") 
-# clean slate (avoids shape mismatches when you change LAG etc.)
+MODEL_DIR  = Path(r"model_5files19") 
+# Clean slate: remove previous model directory to avoid shape mismatches
 if MODEL_DIR.exists():
     shutil.rmtree(MODEL_DIR)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 (MODEL_DIR/"narx").mkdir()
 (MODEL_DIR/"qr").mkdir()
 
-LAG             = 40                # number of past steps
-N_CLUSTERS      = 2
-EPOCHS_NARX     = 300
-EPOCHS_QR       = 100
-BATCH_SIZE_NARX      = 32
-BATCH_SIZE_QR       = 32
-QUANTILES       = [0.1, 0.9]
-OUTPUT_WEIGHTS  = np.array([10, 6,15, 20, 20,  10], dtype="float32") # higher weight to PSD (6 outputs)
+# Model and training configuration
+LAG             = 40                # Number of past steps for NARX
+N_CLUSTERS      = 2                 # Number of clusters for KMeans
+EPOCHS_NARX     = 300               # Max epochs for NARX training
+EPOCHS_QR       = 100               # Max epochs for Quantile Regression
+BATCH_SIZE_NARX      = 32           # Batch size for NARX
+BATCH_SIZE_QR       = 32            # Batch size for QR
+QUANTILES       = [0.1, 0.9]        # Quantiles for QR
+OUTPUT_WEIGHTS  = np.array([10, 6,15, 20, 20,  10], dtype="float32") # Loss weights for outputs
 
-# Add early stopping configuration for NARX
-ES_PATIENCE_NARX = 8        # Reduced from 20
+# Early stopping configuration for NARX
+ES_PATIENCE_NARX = 8        # Number of epochs with no improvement to wait
 ES_MIN_DELTA = 1e-6         # Minimum improvement threshold
-ES_RESTORE_BEST = True
+ES_RESTORE_BEST = True      # Restore best weights after early stopping
 
-# Column layout  (matches report)
+# Column layout (matches report)
 STATE_COLS = ['T_PM', 'c', 'd10', 'd50', 'd90', 'T_TM']
-EXOG_COLS  = ['mf_PM', 'mf_TM', 'Q_g', 'w_crystal']  # Removed constant variables
+EXOG_COLS  = ['mf_PM', 'mf_TM', 'Q_g', 'w_crystal']  # Exogenous input columns
 OUTPUT_COLS = STATE_COLS
 CLUST_COLS  = STATE_COLS + EXOG_COLS
 
+#%%
 # ──  Helper functions  ─────────────────────────────────────────────────────
+# Read a tab-separated text file into a DataFrame (all numeric)
 def read_txt(path: Path) -> pd.DataFrame:
     """Read TAB-separated text file into DataFrame (all numeric)."""
     return pd.read_csv(path, sep='\t', engine='python'
                       ).apply(pd.to_numeric, errors='coerce')
 
+# Remove NaNs and out-of-range sensor values
 def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     """Drop NaNs + obvious sensor out-of-range artefacts."""
     df = df.dropna(subset=CLUST_COLS)
@@ -94,6 +99,7 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
             & (df.mf_PM>=0) & (df.mf_TM>=0) & (df.Q_g>=0)]
     return df.reset_index(drop=True)
 
+# Remove outliers using IQR method
 def clean_iqr(df: pd.DataFrame) -> pd.DataFrame:
     """
     Clear out outliers from data using IQR (Interquantile Range) method
@@ -118,27 +124,7 @@ def clean_iqr(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
-#def harmonise_units(df):
-    """
-    Make sure d10 / d50 / d90 are in *micrometres*.
-
-    Rule:
-        • If the median of a column is smaller than 1 × 10⁻² (i.e. < 1 cm)
-          the data must already be in metres  ➜  multiply by 1 × 10⁶.
-        • Otherwise assume it is already µm and leave unchanged.
-
-    Works row-wise, so mixed units inside the same file are also fixed.
-    """
-    if not USE_MICRONS:
-        return df    # fall-back for future experiments
-
-    for col in PSD_COLS:
-        median = df[col].median(skipna=True)
-        if median < 1e-2:         # < 1 cm  ⇒ data were metres
-            df[col] *= 1e6        # m → µm
-    return df
-
+# Move files with extreme d-values to trash directory
 def remove_trash_files(file_path_list):
     """
     Move the trash files with extreme d-values to different directory 
@@ -149,12 +135,11 @@ def remove_trash_files(file_path_list):
             if column in ['d10', 'd90', 'd50'] and df[column].median() > 1:
                 shutil.copy(path, trash_dir)
 
-
+# Preprocess a file (currently uses IQR cleaning)
 def preprocess(path: Path) -> pd.DataFrame:
     #df = clean_df(read_txt(path)) ##Used IQR method to clean data outliers
     df = clean_iqr(read_txt(path))
     return df
-
 
 # ----------  Lag-matrix creation (newest-to-oldest)  ----------------------
 def make_xy(df: pd.DataFrame, lag=LAG
@@ -178,11 +163,13 @@ def make_xy(df: pd.DataFrame, lag=LAG
     return np.asarray(X, np.float32), np.asarray(Y, np.float32)
 
 # ----------  Custom losses / builders  ------------------------------------
+# Weighted MSE loss for NARX (PSD columns get higher weight)
 def weighted_mse(y_true, y_pred):
     """MSE with per-output weights (PSD columns matter more)."""
     w = tf.constant(OUTPUT_WEIGHTS, dtype=y_true.dtype)
     return tf.reduce_mean(tf.reduce_mean(tf.square(y_true - y_pred) * w, axis=-1))
 
+# Build the NARX model with residual and projection shortcuts
 def build_narx(input_dim: int, output_dim: int) -> tf.keras.Model:
     inputs = layers.Input(shape=(input_dim,))
     
@@ -235,6 +222,7 @@ def build_narx(input_dim: int, output_dim: int) -> tf.keras.Model:
     return tf.keras.Model(inputs=inputs, outputs=outputs)
     
 
+# Build a deeper QR model for d50 and d90 (harder to predict)
 def build_deep_qr(input_dim: int) -> tf.keras.Model:
     """Deeper QR model for d50 and d90 which are harder to predict."""
     inputs = layers.Input(shape=(input_dim,))
@@ -275,6 +263,7 @@ def build_deep_qr(input_dim: int) -> tf.keras.Model:
     
     return tf.keras.Model(inputs=inputs, outputs=outputs)
 
+# Pinball/quantile loss for QR
 def pinball_loss(tau: float):
     """Pinball / quantile loss for τ."""
     def loss(y, y_hat):
@@ -282,12 +271,14 @@ def pinball_loss(tau: float):
         return tf.reduce_mean(tf.maximum(tau * e, (tau - 1) * e))
     return loss
 
+# Custom callback to print metrics at the end of each epoch
 class PrintMetricsCallback(tf.keras.callbacks.Callback):
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
         metrics_str = " ".join([f"{k}={v:.6f}" for k, v in logs.items()])
         print(f"Epoch {epoch+1}: {metrics_str}")
 
+# Warm-up learning rate scheduler callback
 class WarmUpLearningRateScheduler(tf.keras.callbacks.Callback):
     def __init__(self, warmup_epochs=5, initial_lr=1e-6, target_lr=1e-4):
         super().__init__()
@@ -300,6 +291,7 @@ class WarmUpLearningRateScheduler(tf.keras.callbacks.Callback):
             lr = self.initial_lr + (self.target_lr - self.initial_lr) * epoch / self.warmup_epochs
             self.model.optimizer.learning_rate.assign(lr)
 
+# Custom callback for convergence/early stopping
 class ConvergenceCallback(tf.keras.callbacks.Callback):
     def __init__(self, patience=3):
         super().__init__()
@@ -318,7 +310,7 @@ class ConvergenceCallback(tf.keras.callbacks.Callback):
             self.wait += 1
             
         if self.wait >= self.patience:
-            print(f"\n🛑 Early stopping triggered after {epoch+1} epochs (no improvement for {self.patience} epochs)")
+            print(f"\n Early stopping triggered after {epoch+1} epochs (no improvement for {self.patience} epochs)")
             self.model.stop_training = True
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -346,7 +338,7 @@ if not train_dir.exists():
 #%% 2.5. Data Visualization Before and After Preprocessing
 # --------------------------------------------------------------------------
 print("\n" + "="*60)
-print("📊 DATA VISUALIZATION BEFORE AND AFTER PREPROCESSING")
+print(" DATA VISUALIZATION BEFORE AND AFTER PREPROCESSING")
 print("="*60)
 
 import matplotlib.pyplot as plt
@@ -366,7 +358,7 @@ train_files = sorted(train_dir.glob("*.txt"))
 
 # Sample a few files for visualization (to avoid overwhelming plots)
 sample_files = train_files[:5]  # First 5 files
-print(f"\n📁 Analyzing {len(sample_files)} sample files for visualization...")
+print(f"\n Analyzing {len(sample_files)} sample files for visualization...")
 
 # Collect data for visualization
 raw_data = []
@@ -391,13 +383,13 @@ raw_combined = pd.concat(raw_data, ignore_index=True)
 cleaned_combined = pd.concat(cleaned_data, ignore_index=True)
 iqr_combined = pd.concat(iqr_cleaned_data, ignore_index=True)
 
-print(f"\n📈 Data Statistics Summary:")
+print(f"\n Data Statistics Summary:")
 print(f"Raw data: {len(raw_combined)} rows")
 print(f"Cleaned (original): {len(cleaned_combined)} rows")
 print(f"Cleaned (IQR): {len(iqr_combined)} rows")
 
 # 1. Data Loss Analysis
-print(f"\n📉 Data Loss Analysis:")
+print(f"\n Data Loss Analysis:")
 for col in CLUST_COLS:
     raw_count = raw_combined[col].notna().sum()
     cleaned_count = cleaned_combined[col].notna().sum()
@@ -409,7 +401,7 @@ for col in CLUST_COLS:
     print(f"    Cleaned (IQR): {iqr_count} ({iqr_count/raw_count*100:.1f}%)")
 
 # 2. Distribution Comparison Plots
-print(f"\n🎨 Creating distribution comparison plots...")
+print(f"\n Creating distribution comparison plots...")
 
 # Create subplots for each column - adjust layout for 14 columns
 n_cols = 4
@@ -440,7 +432,7 @@ plt.savefig(viz_dir / 'distribution_comparison.png', dpi=150, bbox_inches='tight
 plt.close()
 
 # 3. Box Plots for Outlier Detection
-print(f"📦 Creating box plots for outlier analysis...")
+print(f" Creating box plots for outlier analysis...")
 
 # Create subplots for box plots - adjust layout for 14 columns
 n_cols = 4
@@ -489,7 +481,7 @@ plt.savefig(viz_dir / 'box_plots.png', dpi=150, bbox_inches='tight')
 plt.close()
 
 # 4. Statistical Summary Table
-print(f"📊 Creating statistical summary...")
+print(f" Creating statistical summary...")
 
 stats_summary = {}
 for col in CLUST_COLS:
@@ -529,7 +521,7 @@ with open(viz_dir / 'statistical_summary.json', 'w') as f:
     json.dump(stats_summary, f, indent=2, default=str)
 
 # 5. Correlation Analysis
-print(f"🔗 Creating correlation analysis...")
+print(f" Creating correlation analysis...")
 
 # Calculate correlations for each dataset
 raw_corr = raw_combined[CLUST_COLS].corr()
@@ -585,7 +577,7 @@ plt.savefig(viz_dir / 'correlation_matrices.png', dpi=150, bbox_inches='tight')
 plt.close()
 
 # 6. Time Series Visualization (for one file)
-print(f"⏰ Creating time series visualization...")
+print(f" Creating time series visualization...")
 
 if len(sample_files) > 0:
     sample_file = sample_files[0]
@@ -614,7 +606,7 @@ if len(sample_files) > 0:
     plt.close()
 
 # 7. Outlier Analysis
-print(f"🔍 Creating outlier analysis...")
+print(f" Creating outlier analysis...")
 
 outlier_analysis = {}
 for col in CLUST_COLS:
@@ -648,7 +640,7 @@ with open(viz_dir / 'outlier_analysis.json', 'w') as f:
     json.dump(outlier_analysis, f, indent=2, default=str)
 
 # Print outlier summary
-print(f"\n📊 Outlier Analysis Summary:")
+print(f"\n Outlier Analysis Summary:")
 for col, stats in outlier_analysis.items():
     print(f"  {col}:")
     print(f"    Total points: {stats['total_points']}")
@@ -656,7 +648,7 @@ for col, stats in outlier_analysis.items():
     print(f"    IQR bounds: [{stats['lower_bound']:.2e}, {stats['upper_bound']:.2e}]")
 
 # 8. Data Quality Report
-print(f"\n📋 Creating data quality report...")
+print(f"\n Creating data quality report...")
 
 quality_report = {
     'preprocessing_summary': {
@@ -683,9 +675,9 @@ for col in CLUST_COLS:
 with open(viz_dir / 'data_quality_report.json', 'w') as f:
     json.dump(quality_report, f, indent=2, default=str)
 
-print(f"\n✅ Data visualization complete!")
-print(f"📁 Visualizations saved to: {viz_dir}")
-print(f"📊 Data Quality Summary:")
+print(f"\n Data visualization complete!")
+print(f" Visualizations saved to: {viz_dir}")
+print(f" Data Quality Summary:")
 print(f"   Raw data rows: {len(raw_combined)}")
 print(f"   Cleaned data rows: {len(iqr_combined)}")
 print(f"   Data retention: {len(iqr_combined)/len(raw_combined)*100:.1f}%")
@@ -696,7 +688,7 @@ print("\n" + "="*60)
 #%% 2.5. Clustering Analysis and Scoring
 # --------------------------------------------------------------------------
 print("\n" + "="*60)
-print("🔍 CLUSTERING ANALYSIS AND SCORING")
+print(" CLUSTERING ANALYSIS AND SCORING")
 print("="*60)
 
 feat = []
@@ -722,12 +714,12 @@ import seaborn as sns
 cluster_labels = kmeans.labels_
 unique_clusters = np.unique(cluster_labels)
 
-print(f"\n📊 Clustering Results:")
+print(f"\n Clustering Results:")
 print(f"Number of clusters: {len(unique_clusters)}")
 print(f"Total files: {len(train_files)}")
 
 # 1. Cluster Distribution Analysis
-print(f"\n📈 Cluster Distribution:")
+print(f"\n Cluster Distribution:")
 cluster_counts = np.bincount(cluster_labels)
 for cid in unique_clusters:
     count = cluster_counts[cid]
@@ -735,7 +727,7 @@ for cid in unique_clusters:
     print(f"  Cluster {cid}: {count} files ({percentage:.1f}%)")
 
 # 2. Clustering Quality Metrics
-print(f"\n🎯 Clustering Quality Metrics:")
+print(f"\n Clustering Quality Metrics:")
 silhouette = silhouette_score(feat_s, cluster_labels)
 calinski = calinski_harabasz_score(feat_s, cluster_labels)
 davies = davies_bouldin_score(feat_s, cluster_labels)
@@ -745,7 +737,7 @@ print(f"  Calinski-Harabasz Score: {calinski:.2f} (Higher is better)")
 print(f"  Davies-Bouldin Score: {davies:.4f} (Lower is better)")
 
 # 3. Feature Importance Analysis
-print(f"\n🔍 Feature Importance Analysis:")
+print(f"\n Feature Importance Analysis:")
 feature_names = []
 for col in CLUST_COLS:
     feature_names.extend([f'{col}_mean', f'{col}_std', f'{col}_min', f'{col}_max'])
@@ -797,7 +789,7 @@ for col in CLUST_COLS:
     
     # Check if this feature has low variance
     if feature_importance[std_idx] < 0.1:
-        print(f"    ⚠️  Low std importance - may indicate low variance in {col}")
+        print(f"      Low std importance - may indicate low variance in {col}")
     
     # Show actual variance values for debugging
     feature_values = feat[:, std_idx]  # Get std values for this column
@@ -830,7 +822,7 @@ for i in range(len(unique_clusters)):
         print(f"  Cluster {cid1} ↔ Cluster {cid2}: {distance:.4f}")
 
 # 6. Create Clustering Visualization
-print(f"\n🎨 Creating clustering visualizations...")
+print(f"\n Creating clustering visualizations...")
 viz_dir = MODEL_DIR / 'clustering_analysis'
 viz_dir.mkdir(exist_ok=True)
 
@@ -915,9 +907,9 @@ import json
 with open(viz_dir / 'clustering_analysis_report.json', 'w') as f:
     json.dump(analysis_report, f, indent=2)
 
-print(f"\n✅ Clustering analysis complete!")
-print(f"📁 Analysis saved to: {viz_dir}")
-print(f"📊 Quality Summary:")
+print(f"\nClustering analysis complete!")
+print(f" Analysis saved to: {viz_dir}")
+print(f" Quality Summary:")
 print(f"   Silhouette: {silhouette:.4f} ({'Good' if silhouette > 0.3 else 'Fair' if silhouette > 0.1 else 'Poor'})")
 print(f"   Balance: {min(cluster_counts)/max(cluster_counts):.3f} ({'Good' if min(cluster_counts)/max(cluster_counts) > 0.5 else 'Fair' if min(cluster_counts)/max(cluster_counts) > 0.3 else 'Poor'})")
 
@@ -931,7 +923,7 @@ print("\n🔧 Phase 1: NARX Data Preprocessing and Preparation …")
 cluster_data = {}
 
 for cid in range(N_CLUSTERS):
-    print(f"\n📊 Preprocessing data for cluster {cid}...")
+    print(f"\n Preprocessing data for cluster {cid}...")
     Xc, Yc = [], []
     for idx, p in enumerate(train_files):
         if kmeans.labels_[idx] != cid:
@@ -941,7 +933,7 @@ for cid in range(N_CLUSTERS):
             Xc.append(x); Yc.append(y)
     
     if not Xc:
-        print(f"   ⚠️  No data found for cluster {cid}, skipping...")
+        print(f"     No data found for cluster {cid}, skipping...")
         continue
 
     Xc = np.vstack(Xc);  Yc = np.vstack(Yc)
@@ -966,18 +958,18 @@ for cid in range(N_CLUSTERS):
         'output_dim': Yc.shape[1]
     }
     
-    print(f"   ✅ Cluster {cid} preprocessing complete:")
+    print(f"    Cluster {cid} preprocessing complete:")
     print(f"      Training samples: {len(Xtr)}")
     print(f"      Validation samples: {len(Xvl)}")
     print(f"      Input dimension: {Xc.shape[1]}")
     print(f"      Output dimension: {Yc.shape[1]}")
 
-print(f"\n✅ Phase 1 complete! Preprocessed data for {len(cluster_data)} clusters.")
+print(f"\n Phase 1 complete! Preprocessed data for {len(cluster_data)} clusters.")
 
 #%%
-print("\n🚀 Phase 2: NARX Model Training …")
+print("\n Phase 2: NARX Model Training …")
 for cid, data in cluster_data.items():
-    print(f"\n🚀 Training NARX model for cluster {cid}")
+    print(f"\n Training NARX model for cluster {cid}")
     print(f"   Training samples: {len(data['Xtr'])}")
     print(f"   Validation samples: {len(data['Xvl'])}")
     print(f"   Early stopping patience: {ES_PATIENCE_NARX} epochs")
@@ -1033,7 +1025,7 @@ for cid, data in cluster_data.items():
     best_val_loss = min(history_narx.history['val_loss'])
     final_epochs = len(history_narx.history['val_loss'])
     
-    print(f"\n✅ Cluster {cid} training complete!")
+    print(f"\n Cluster {cid} training complete!")
     print(f"   Best validation loss: {best_val_loss:.6f} at epoch {best_epoch}")
     print(f"   Total epochs trained: {final_epochs}")
     print(f"   Time saved: {EPOCHS_NARX - final_epochs} epochs")
@@ -1170,16 +1162,16 @@ for cid, data in cluster_data.items():
     plt.close()
     
     # Print summary statistics
-    print(f"\n📊 Detailed Report Generated:")
+    print(f"\n Detailed Report Generated:")
     print(f"   Report file: {report_file}")
     print(f"   Analysis plot: {report_dir}/cluster_{cid}_narx_analysis.png")
     print(f"   Loss improvement: {narx_report['performance_metrics']['loss_improvement']:.6f}")
     print(f"   Convergence rate: {narx_report['performance_metrics']['convergence_rate']:.2f}%")
     print(f"   Early stopping triggered: {narx_report['convergence_analysis']['early_stopping_triggered']}")
     if narx_report['convergence_analysis']['plateau_detected']:
-        print(f"   ⚠️  Plateau detected - model stopped improving")
+        print(f"     Plateau detected - model stopped improving")
     else:
-        print(f"   ✅ Model converged naturally")
+        print(f"    Model converged naturally")
 
 
     plt.figure()
@@ -1194,7 +1186,7 @@ for cid, data in cluster_data.items():
     plt.close()
     print(f"Saved NARX loss curve for cluster {cid} to narx/cluster_{cid}_loss_curve.png")
 
-print("✅ NARX training complete.")
+print(" NARX training complete.")
 
 
 

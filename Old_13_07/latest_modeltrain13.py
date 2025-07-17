@@ -330,7 +330,7 @@ trash_dir = RAW_ROOT/'trash'
 
 ## Create trash_dir and copy the trash files from dataset to the trash_dir
 if not trash_dir.exists(): 
-    trash_dir.mkdir()
+    trash_dir.mkdir(parents=True, exist_ok=True)
     remove_trash_files(RAW_ROOT.glob("*.txt"))   
 
 if not train_dir.exists():

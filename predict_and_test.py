@@ -37,7 +37,7 @@ np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
 # Configuration
-MODEL_DIR = Path("model_5files13")  # Updated to match training script
+MODEL_DIR = Path("model_5files18")  # Updated to match training script
 PSD_COLS = ('d10', 'd50', 'd90')
 now = datetime.now().strftime("%Y%m%d_%H%M%S")
 # Load metadata
