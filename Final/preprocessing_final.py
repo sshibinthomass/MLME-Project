@@ -5,7 +5,7 @@ Enhanced Prediction Script for SFC Data with Open-Loop and Closed-Loop
 - Handles one or many files (Beat-The-Felix or any .txt)
 - Produces CQR-calibrated uncertainty intervals and summary metrics
 """
-
+#%%
 from __future__ import annotations
 
 import numpy as np
@@ -19,8 +19,8 @@ from pathlib import Path
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # --- PATHS AND GLOBALS (update as needed) ---
-TEST_DIR   = Path(r"Beat-the-Felix")     #Directory with test file(s)
-MODEL_ROOT = Path(r"model_5files17")      # Directory with saved models
+TEST_DIR   = Path(r"Model_Train/Beat-the-Felix")     #Directory with test file(s)
+MODEL_ROOT = Path(r"Model_Train/Model")      # Directory with saved models
 
 # --- LOAD METADATA FROM TRAINING ---
 meta       = json.loads((MODEL_ROOT/'metadata.json').read_text())
@@ -336,3 +336,4 @@ def plot_scatter(df, out, mode):
         plt.tight_layout()
         plt.savefig(out / f"{col}_{mode}_scatter.png", dpi=200)
         plt.close()
+# %%

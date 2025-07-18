@@ -1,3 +1,4 @@
+#%%
 import numpy as np
 import time
 import pandas as pd
@@ -23,13 +24,13 @@ Requires separate preprocessing module (preprocessing_final.py) for data cleanin
 """
 
 # === EASY TOGGLE FLAGS ===
-SAVE_FILES = False   # Toggle file/CSV saving ON/OFF
-SAVE_PLOTS = False  # Toggle plot generation ON/OFF
+SAVE_FILES = True   # Toggle file/CSV saving ON/OFF
+SAVE_PLOTS = True  # Toggle plot generation ON/OFF
 
 # --- PATHS AND GLOBALS ---
-file_path   = Path(r"Beat-the-Felix")         # Directory with test file(s)
-MODEL_ROOT = Path(r"model_5files17")          # Directory with saved models
-OUT_DIR    = Path(r"Beat-the-Felix") / "OUTPUTS"   # Change if needed
+file_path   = Path(r"Model_Train/Beat-the-Felix")         # Directory with test file(s)
+MODEL_ROOT = Path(r"Model_Train/Model")          # Directory with saved models
+OUT_DIR    = Path(r"Beat-the-Felix-Prediction") / "OUTPUTS"   # Change if needed
 if OUT_DIR.exists():
     shutil.rmtree(OUT_DIR)
 OUT_DIR.mkdir(exist_ok=True)
@@ -156,3 +157,5 @@ def run_prediction_on_dir(test_dir=file_path, out_dir=OUT_DIR):
 # --- RUN MAIN ---
 if __name__ == "__main__":
     run_prediction_on_dir()
+
+# %%

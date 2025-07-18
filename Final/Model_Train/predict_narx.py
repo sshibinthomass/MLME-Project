@@ -37,7 +37,7 @@ np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
 # Configuration
-MODEL_DIR = Path("model_5files18")  # Updated to match training script
+MODEL_DIR = Path("Model_Train/Model")  # Updated to match training script
 PSD_COLS = ('d10', 'd50', 'd90')
 now = datetime.now().strftime("%Y%m%d_%H%M%S")
 # Load metadata
@@ -452,7 +452,7 @@ def main():
     
     # Create output directory for this run
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"NARX_Prediction/prediction_results_{timestamp}")
+    output_dir = Path(f"Model_Train/NARX_Prediction/prediction_results_{timestamp}")
     output_dir.mkdir(exist_ok=True)
     print(f"Created output directory: {output_dir}")
     
@@ -468,7 +468,7 @@ def main():
     all_file_paths = []
     
     # Test on calibration data if available
-    calib_dir = Path("Beat-the-Felix")
+    calib_dir = Path("Model_Train/Beat-the-Felix")
     if calib_dir.exists():
         print(f"\nTesting on calibration data from: {calib_dir}")
         calib_files = list(calib_dir.glob("*.txt"))
